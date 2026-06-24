@@ -1,0 +1,23 @@
+bin/
+*.o
+ui/node_modules/
+ui/dist/
+/tollwing-server
+/tollwing-terraform
+/tollwing-cli
+/tollwing-agent
+/governance
+/tollwing-license
+
+# License issuer secrets and issued licenses — never commit (DEC-012).
+# The vendor's private Ed25519 signing key is held off-repo; the embedded
+# public key in pkg/license is the only key half that belongs in the tree.
+*.key
+*.pem
+issuer.*
+*.license.json
+
+# Private planning overlay (run: make overlay) — symlinks into .planning/
+docs/strategy
+docs/proposals
+.planning

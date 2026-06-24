@@ -1,0 +1,31 @@
+name: cloud-service-public
+description: >
+  Traffic to a managed AWS service through its public endpoint. DNS/FOCUS
+  enrichment resolves the destination as a cloud service, so the cost engine
+  receives cloud_service_public rather than inferring it from a CIDR.
+  Same-region AWS service traffic is $0/GiB. 1 GiB -> $0.00.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  api:
+    zone: us-east-1a
+    namespace: shop
+external:
+  s3-public:
+    ip: 52.216.10.10
+traffic:
+  - from: api
+    to: s3-public
+    requests: 1048576
+    requestBytes: 512
+    responseBytes: 512
+    cloudServicePublic: true
+expect:
+  edges:
+    - from: api
+      to: s3-public
+      type: cloud_service_public
+      costUSD: 0

@@ -1,0 +1,106 @@
+[
+  {
+    "scenario": "cloud-service-public",
+    "from": "api",
+    "to": "s3-public",
+    "traffic_type": "cloud_service_public",
+    "bytes": 1073741824,
+    "cost_usd": 0
+  },
+  {
+    "scenario": "cross-az-differentiator",
+    "from": "cart",
+    "to": "checkout",
+    "traffic_type": "cross_az",
+    "bytes": 1073741824,
+    "cost_usd": 0.01
+  },
+  {
+    "scenario": "cross-region",
+    "from": "api",
+    "to": "replica",
+    "traffic_type": "cross_region",
+    "bytes": 1073741824,
+    "cost_usd": 0.02
+  },
+  {
+    "scenario": "internet-egress-tiered",
+    "from": "api",
+    "to": "internet",
+    "traffic_type": "internet_egress",
+    "bytes": 5368709120,
+    "cost_usd": 0.36
+  },
+  {
+    "scenario": "intra-node",
+    "from": "worker",
+    "to": "local-cache",
+    "traffic_type": "intra_node",
+    "bytes": 1073741824,
+    "cost_usd": 0
+  },
+  {
+    "scenario": "mesh-sidecar-dedup",
+    "from": "app",
+    "to": "app-sidecar",
+    "traffic_type": "service_mesh_internal",
+    "bytes": 8589934592,
+    "cost_usd": 0
+  },
+  {
+    "scenario": "nat-gateway",
+    "from": "worker",
+    "to": "nat",
+    "traffic_type": "nat_gateway",
+    "bytes": 2147483648,
+    "cost_usd": 0.09
+  },
+  {
+    "scenario": "same-zone",
+    "from": "api",
+    "to": "cache",
+    "traffic_type": "same_zone",
+    "bytes": 1073741824,
+    "cost_usd": 0
+  },
+  {
+    "scenario": "transit-gateway",
+    "from": "api",
+    "to": "tgw-peer",
+    "traffic_type": "transit_gateway",
+    "bytes": 1073741824,
+    "cost_usd": 0.02
+  },
+  {
+    "scenario": "transitive-attribution",
+    "from": "cart",
+    "to": "db",
+    "traffic_type": "cross_az",
+    "bytes": 536870912000,
+    "cost_usd": 5
+  },
+  {
+    "scenario": "transitive-attribution",
+    "from": "checkout",
+    "to": "cart",
+    "traffic_type": "same_zone",
+    "bytes": 1073741824,
+    "cost_usd": 0
+  },
+  {
+    "scenario": "vpc-endpoint",
+    "from": "api",
+    "to": "s3-endpoint",
+    "traffic_type": "vpc_endpoint",
+    "bytes": 1073741824,
+    "cost_usd": 0.01
+  },
+  {
+    "scenario": "vpc-peering",
+    "from": "api",
+    "to": "peer-db",
+    "traffic_type": "vpc_peering",
+    "bytes": 1073741824,
+    "cost_usd": 0.01
+  }
+]

@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  # Governance gate — stdlib-only Go, no BPF toolchain. Keeps the decision index
+  # in sync and blocks constitutional regressions. See CONSTITUTION.md.
+  governance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Decision index in sync (run 'go run ./tools/governance index' to fix)
+        run: go run ./tools/governance index -check
+      - name: No blocking constitutional violations
+        run: go run ./tools/governance scan -gate
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # go vet walks the go:embed of the compiled BPF objects, so compile first.
+      - name: Install LLVM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+      - name: Compile BPF
+        run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
+      - name: Go vet
+        run: GOOS=linux GOARCH=amd64 go vet ./...
+      - name: Vulnerability scan (govulncheck, advisory)
+        continue-on-error: true
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install LLVM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+      - name: Compile BPF
+        run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
+      - name: Run tests (race detector)
+        run: go test -race -count=1 -timeout=120s ./pkg/...
+
+  # Pure-Go proof/oracle suite — no cluster, no kernel, no cloud account.
+  sim:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Oracle proof suite + demo
+        run: |
+          make sim
+          make demo
+
+  build:
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install LLVM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+      - name: Compile BPF (x86 + arm64)
+        run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
+      - name: Verify BPF objects (hooks present)
+        run: |
+          file pkg/ebpf/bpf/bin/x86/tollwing.bpf.o
+          llvm-objdump -h pkg/ebpf/bpf/bin/x86/tollwing.bpf.o | grep "cgroup/connect4"
+          llvm-objdump -h pkg/ebpf/bpf/bin/x86/tollwing.bpf.o | grep "sockops"
+      - name: Build agent (amd64 + arm64)
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/tollwing-agent-amd64 ./cmd/tollwing-agent
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/tollwing-agent-arm64 ./cmd/tollwing-agent
+      - name: Build Terraform cost estimator (cross-platform)
+        run: CGO_ENABLED=0 go build -o bin/tollwing-terraform ./cmd/tollwing-terraform
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+
+  helm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.0'
+      - name: Helm lint (agent)
+        run: helm lint deploy/helm/tollwing-agent
+      - name: Helm template (agent renders a DaemonSet)
+        run: |
+          helm template test deploy/helm/tollwing-agent \
+            --set agent.provider=aws --set agent.region=us-east-1 | grep "kind: DaemonSet"

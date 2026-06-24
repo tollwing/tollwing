@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "tollwing-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tollwing-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "tollwing-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tollwing-agent.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "tollwing-agent.serviceAccountName" . }}
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - -cgroup={{ .Values.agent.cgroupPath }}
+            - -poll-interval={{ .Values.agent.pollInterval }}
+            - -sample-rate={{ .Values.agent.sampleRate }}
+            - -metrics=:{{ .Values.metrics.port }}
+            {{- if .Values.agent.trackUDP }}
+            - -udp
+            {{- end }}
+            {{- if .Values.agent.debug }}
+            - -debug
+            {{- end }}
+            {{- if .Values.agent.jsonLog }}
+            - -json
+            {{- end }}
+            - -mem-limit={{ .Values.agent.memLimitMB }}
+            - -gogc={{ .Values.agent.gogc }}
+            {{- if .Values.agent.provider }}
+            - -provider={{ .Values.agent.provider }}
+            {{- end }}
+            {{- if .Values.agent.region }}
+            - -region={{ .Values.agent.region }}
+            {{- end }}
+            {{- if .Values.agent.natsURL }}
+            - -nats={{ .Values.agent.natsURL }}
+            {{- end }}
+            {{- if .Values.agent.clusterName }}
+            - -cluster={{ .Values.agent.clusterName }}
+            {{- end }}
+          securityContext:
+            privileged: true
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: cgroup
+              mountPath: {{ .Values.agent.cgroupPath }}
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+              readOnly: true
+        {{- if .Values.opencostPlugin.enabled }}
+        - name: opencost-plugin
+          image: "{{ .Values.opencostPlugin.image.repository }}:{{ .Values.opencostPlugin.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.opencostPlugin.image.pullPolicy | default "IfNotPresent" }}
+          env:
+            - name: TOLLWING_API
+              value: "{{ .Values.opencostPlugin.tollwingAPI }}"
+            - name: LISTEN_ADDR
+              value: ":{{ .Values.opencostPlugin.port }}"
+          ports:
+            - name: opencost
+              containerPort: {{ .Values.opencostPlugin.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: opencost
+            initialDelaySeconds: 5
+          resources:
+            {{- toYaml .Values.opencostPlugin.resources | nindent 12 }}
+        {{- end }}
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: {{ .Values.agent.cgroupPath }}
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

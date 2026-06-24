@@ -1,0 +1,30 @@
+name: vpc-peering
+description: >
+  Traffic to a peered VPC (destination in a registered peering CIDR). $0.01/GiB
+  on AWS. 1 GiB → $0.01.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  api:
+    zone: us-east-1a
+    namespace: shop
+external:
+  peer-db:
+    ip: 52.94.1.50
+vpcPeeringCIDRs:
+  - 52.94.0.0/16
+traffic:
+  - from: api
+    to: peer-db
+    requests: 1048576
+    requestBytes: 512
+    responseBytes: 512
+expect:
+  edges:
+    - from: api
+      to: peer-db
+      type: vpc_peering
+      costUSD: 0.01

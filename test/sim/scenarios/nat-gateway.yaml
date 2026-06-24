@@ -1,0 +1,31 @@
+name: nat-gateway
+description: >
+  Traffic egressing through a NAT gateway (a known NAT IP in private space).
+  Charged per-GB ($0.045/GiB on AWS); the per-hour fixed charge is deliberately
+  NOT part of per-flow cost (P4 — only bytes × per-GB rate). 2 GiB → $0.09.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  worker:
+    zone: us-east-1a
+    namespace: batch
+external:
+  nat:
+    ip: 10.0.99.1
+natGatewayIPs:
+  - 10.0.99.1
+traffic:
+  - from: worker
+    to: nat
+    requests: 2097152 # 2 * 2^20
+    requestBytes: 1024
+    responseBytes: 0 # 2 GiB
+expect:
+  edges:
+    - from: worker
+      to: nat
+      type: nat_gateway
+      costUSD: 0.09 # 2 GiB * $0.045/GiB

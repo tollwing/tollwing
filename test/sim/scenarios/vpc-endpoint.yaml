@@ -1,0 +1,31 @@
+name: vpc-endpoint
+description: >
+  Traffic to a managed service over a VPC endpoint (destination in a registered
+  endpoint CIDR) — cheaper than routing the same bytes out through NAT/internet.
+  $0.01/GiB on AWS. 1 GiB → $0.01.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  api:
+    zone: us-east-1a
+    namespace: shop
+external:
+  s3-endpoint:
+    ip: 3.5.1.100
+vpcEndpointCIDRs:
+  - 3.5.0.0/16
+traffic:
+  - from: api
+    to: s3-endpoint
+    requests: 1048576
+    requestBytes: 512
+    responseBytes: 512
+expect:
+  edges:
+    - from: api
+      to: s3-endpoint
+      type: vpc_endpoint
+      costUSD: 0.01

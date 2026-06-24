@@ -1,0 +1,35 @@
+name: cross-az-differentiator
+description: >
+  The headline differentiator (P5, DEC-003). cart lives in zone-a; it dials the
+  checkout ClusterIP whose backends live in zone-b. Every byte is cross_az and
+  must be attributed to the dialed service. 2^20 requests of 512B up + 512B down
+  = exactly 1 GiB, so the cost is exactly $0.01 at the AWS cross-AZ rate
+  ($0.01/GiB). Post-DNAT-only tools (OpenCost/Kubecost) attribute this to the
+  source pod, or miss it entirely — the L2 differential proves the gap.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+  us-east-1b:
+    region: us-east-1
+services:
+  cart:
+    zone: us-east-1a
+    namespace: shop
+  checkout:
+    zone: us-east-1b
+    namespace: shop
+    clusterIP: true
+traffic:
+  - from: cart
+    to: checkout
+    requests: 1048576 # 2^20
+    requestBytes: 512
+    responseBytes: 512 # total = 2^20 * 1024 = 2^30 B = exactly 1 GiB
+expect:
+  edges:
+    - from: cart
+      to: checkout
+      type: cross_az
+      costUSD: 0.01 # 1 GiB * $0.01/GiB

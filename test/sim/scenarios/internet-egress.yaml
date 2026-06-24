@@ -1,0 +1,29 @@
+name: internet-egress-tiered
+description: >
+  A service egresses 5 GiB to the public internet. AWS gives the first 1 GiB/month
+  free, then $0.09/GiB — so 5 GiB = (5-1) * 0.09 = $0.36. Exercises the multi-tier
+  cumulative pricing path end-to-end (the case a flat-rate oracle would get wrong).
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  api:
+    zone: us-east-1a
+    namespace: shop
+external:
+  internet:
+    ip: 8.8.8.8
+traffic:
+  - from: api
+    to: internet
+    requests: 5242880 # 5 * 2^20
+    requestBytes: 1024
+    responseBytes: 0 # total = 5 * 2^30 B = 5 GiB
+expect:
+  edges:
+    - from: api
+      to: internet
+      type: internet_egress
+      costUSD: 0.36 # (5 - 1 free) GiB * $0.09/GiB

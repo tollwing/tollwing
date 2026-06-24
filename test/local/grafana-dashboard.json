@@ -1,0 +1,233 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "tollwing",
+    "title": "Tollwing - Network Cost Monitor",
+    "tags": ["tollwing", "ebpf", "network", "cost"],
+    "timezone": "browser",
+    "refresh": "5s",
+    "time": { "from": "now-15m", "to": "now" },
+    "templating": {
+      "list": [
+        {
+          "name": "namespace",
+          "type": "query",
+          "query": "label_values(tollwing_pod_tx_bytes_total, namespace)",
+          "refresh": 2,
+          "multi": true,
+          "includeAll": true,
+          "current": { "text": "All", "value": "$__all" }
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Active Connections",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+        "targets": [{ "expr": "sum(tollwing_active_connections)", "legendFormat": "Active" }],
+        "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 500}, {"color": "red", "value": 2000}] } } }
+      },
+      {
+        "id": 2,
+        "title": "Connections Established",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+        "targets": [{ "expr": "sum(tollwing_connections_established_total)", "legendFormat": "Established" }],
+        "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "blue", "value": null}] } } }
+      },
+      {
+        "id": 3,
+        "title": "Total TX",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+        "targets": [{ "expr": "sum(tollwing_tx_bytes_total)", "legendFormat": "TX" }],
+        "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "green", "value": null}] } } }
+      },
+      {
+        "id": 4,
+        "title": "Total RX",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+        "targets": [{ "expr": "sum(tollwing_rx_bytes_total)", "legendFormat": "RX" }],
+        "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "purple", "value": null}] } } }
+      },
+      {
+        "id": 30,
+        "title": "Estimated Cost (Total)",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+        "targets": [{ "expr": "sum(tollwing_cost_usd_total)", "legendFormat": "Cost" }],
+        "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4, "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}] } } }
+      },
+      {
+        "id": 31,
+        "title": "Sidecar Skipped",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+        "targets": [{ "expr": "sum(tollwing_sidecar_skipped_bytes_total)", "legendFormat": "Skipped" }],
+        "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "blue", "value": null}] } } }
+      },
+      {
+        "id": 5,
+        "title": "TX Throughput by Traffic Type",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+        "targets": [{ "expr": "sum by (traffic_type) (rate(tollwing_tx_bytes_total[1m]))", "legendFormat": "{{traffic_type}}" }],
+        "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } } }
+      },
+      {
+        "id": 6,
+        "title": "RX Throughput by Traffic Type",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+        "targets": [{ "expr": "sum by (traffic_type) (rate(tollwing_rx_bytes_total[1m]))", "legendFormat": "{{traffic_type}}" }],
+        "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } } }
+      },
+      {
+        "id": 32,
+        "title": "Cost Rate by Traffic Type ($/hour)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+        "targets": [{ "expr": "sum by (traffic_type) (rate(tollwing_cost_usd_total[5m])) * 3600", "legendFormat": "{{traffic_type}}" }],
+        "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4, "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } } }
+      },
+      {
+        "id": 33,
+        "title": "Cumulative Cost by Traffic Type",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+        "targets": [{ "expr": "sum by (traffic_type) (tollwing_cost_usd_total)", "legendFormat": "{{traffic_type}}" }],
+        "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4, "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 7,
+        "title": "Connections by Traffic Type",
+        "type": "piechart",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+        "targets": [{ "expr": "sum by (traffic_type) (tollwing_connections_by_type)", "legendFormat": "{{traffic_type}}" }],
+        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "legend": { "placement": "right" } }
+      },
+      {
+        "id": 8,
+        "title": "Connection Rate (per second)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+        "targets": [{ "expr": "sum(rate(tollwing_connections_established_total[1m]))", "legendFormat": "conn/s" }],
+        "fieldConfig": { "defaults": { "unit": "cps", "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 9,
+        "title": "Retransmissions",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+        "targets": [
+          { "expr": "sum(rate(tollwing_retransmit_count_total[1m]))", "legendFormat": "retransmits/s" },
+          { "expr": "sum(rate(tollwing_retransmit_bytes_total[1m]))", "legendFormat": "retransmit bytes/s" }
+        ],
+        "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 34,
+        "title": "Top 10 Pods by Egress",
+        "type": "bargauge",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+        "targets": [{ "expr": "topk(10, sum by (namespace, pod) (tollwing_pod_tx_bytes_total{namespace=~\"$namespace\"}))", "legendFormat": "{{namespace}}/{{pod}}" }],
+        "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "continuous-GrYlRd" } } },
+        "options": { "orientation": "horizontal", "displayMode": "gradient" }
+      },
+      {
+        "id": 35,
+        "title": "Top 10 Pods by Cost",
+        "type": "bargauge",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+        "targets": [{ "expr": "topk(10, sum by (namespace, pod) (tollwing_pod_cost_usd_total{namespace=~\"$namespace\"}))", "legendFormat": "{{namespace}}/{{pod}}" }],
+        "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4, "color": { "mode": "continuous-GrYlRd" } } },
+        "options": { "orientation": "horizontal", "displayMode": "gradient" }
+      },
+      {
+        "id": 36,
+        "title": "Per-Pod TX Rate",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+        "targets": [{ "expr": "topk(10, sum by (namespace, pod) (rate(tollwing_pod_tx_bytes_total{namespace=~\"$namespace\"}[1m])))", "legendFormat": "{{namespace}}/{{pod}}" }],
+        "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 37,
+        "title": "Per-Pod Cost Rate ($/hour)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+        "targets": [{ "expr": "topk(10, sum by (namespace, pod) (rate(tollwing_pod_cost_usd_total{namespace=~\"$namespace\"}[5m])) * 3600)", "legendFormat": "{{namespace}}/{{pod}}" }],
+        "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4, "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 38,
+        "title": "Sidecar Dedup Savings",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 44 },
+        "targets": [
+          { "expr": "sum(rate(tollwing_sidecar_skipped_bytes_total[1m]))", "legendFormat": "skipped bytes/s" },
+          { "expr": "sum(tollwing_sidecar_skipped_connections_total)", "legendFormat": "skipped conns" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 10,
+        "title": "Active Connections Over Time",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 44 },
+        "targets": [{ "expr": "sum(tollwing_active_connections)", "legendFormat": "active" }],
+        "fieldConfig": { "defaults": { "custom": { "fillOpacity": 15 } } }
+      },
+      {
+        "id": 11,
+        "title": "Cumulative Bytes Transferred",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 44 },
+        "targets": [
+          { "expr": "sum(tollwing_tx_bytes_total)", "legendFormat": "TX total" },
+          { "expr": "sum(tollwing_rx_bytes_total)", "legendFormat": "RX total" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 40,
+        "title": "Agent Health: Cache Sizes",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 52 },
+        "targets": [
+          { "expr": "tollwing_enricher_cache_size", "legendFormat": "enricher cache" },
+          { "expr": "tollwing_dns_cache_size", "legendFormat": "DNS cache" }
+        ],
+        "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 41,
+        "title": "Agent Health: Memory",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 52 },
+        "targets": [
+          { "expr": "tollwing_heap_alloc_bytes", "legendFormat": "heap alloc" },
+          { "expr": "tollwing_heap_sys_bytes", "legendFormat": "heap sys" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } } }
+      },
+      {
+        "id": 42,
+        "title": "Agent Health: Goroutines & Polls",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 52 },
+        "targets": [
+          { "expr": "tollwing_goroutines", "legendFormat": "goroutines" },
+          { "expr": "rate(tollwing_poll_total[1m])", "legendFormat": "polls/s" },
+          { "expr": "rate(tollwing_ringbuf_drops_total[1m])", "legendFormat": "ringbuf drops/s" }
+        ],
+        "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10 } } }
+      }
+    ],
+    "schemaVersion": 39
+  },
+  "overwrite": true
+}

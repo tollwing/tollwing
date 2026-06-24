@@ -1,0 +1,50 @@
+name: transitive-attribution
+description: >
+  The transitive cross-AZ cascade — the killer cost feature (P5). checkout's own
+  edge (checkout→cart) is same-zone and free, but it drives cart→db, a cross-AZ
+  call costing $5. Responsibility-weighted attribution charges that downstream
+  closure back to checkout: direct $0, induced $5. A service that looks cheap on
+  its own edges yet triggers an expensive cascade is exactly what this catches.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+  us-east-1b:
+    region: us-east-1
+services:
+  checkout:
+    zone: us-east-1a
+    namespace: shop
+  cart:
+    zone: us-east-1a
+    namespace: shop
+  db:
+    zone: us-east-1b
+    namespace: shop
+traffic:
+  - from: checkout
+    to: cart
+    requests: 1048576
+    requestBytes: 512
+    responseBytes: 512 # same_zone, $0 — but non-zero bytes (responsibility denominator)
+  - from: cart
+    to: db
+    requests: 524288000 # 500 * 2^20
+    requestBytes: 1024
+    responseBytes: 0 # 500 GiB cross_az * $0.01/GiB = $5.00
+expect:
+  edges:
+    - from: checkout
+      to: cart
+      type: same_zone
+      costUSD: 0
+    - from: cart
+      to: db
+      type: cross_az
+      costUSD: 5
+  attribution:
+    from: checkout
+    directUSD: 0 # checkout's own edges are all same-zone
+    inducedUSD: 5 # the cart→db cross-AZ cost, charged back to checkout
+    totalUSD: 5

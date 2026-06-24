@@ -1,0 +1,29 @@
+name: same-zone
+description: >
+  Two services in the same zone. SameZone is free on every cloud ($0) — but it
+  must still be classified as same_zone (never Unknown), so operators can see how
+  much traffic is well-co-located.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  api:
+    zone: us-east-1a
+    namespace: shop
+  cache:
+    zone: us-east-1a
+    namespace: shop
+traffic:
+  - from: api
+    to: cache
+    requests: 1048576
+    requestBytes: 512
+    responseBytes: 512
+expect:
+  edges:
+    - from: api
+      to: cache
+      type: same_zone
+      costUSD: 0

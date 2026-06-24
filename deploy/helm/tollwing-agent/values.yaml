@@ -1,0 +1,66 @@
+image:
+  repository: ghcr.io/tollwing/tollwing-agent
+  tag: ""  # defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+agent:
+  cgroupPath: /sys/fs/cgroup
+  trackUDP: false
+  sampleRate: 1
+  pollInterval: 5s
+  debug: false
+  jsonLog: true
+  # Go runtime memory tuning.
+  memLimitMB: 128    # GOMEMLIMIT soft limit
+  gogc: 50           # GC target percentage (lower = less memory, more CPU)
+  # Cloud provider and region for cost calculation (auto-detected if empty).
+  provider: ""       # "aws", "gcp", "azure"
+  region: ""         # e.g., "us-east-1"
+  # NATS configuration for shipping flows to control plane.
+  natsURL: ""        # e.g., "nats://tollwing-nats:4222" (empty=disabled)
+  clusterName: ""    # cluster identifier for multi-cluster
+  nodeName: ""       # node name override (default: hostname)
+
+metrics:
+  port: 9990
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+tolerations:
+  - operator: Exists
+
+nodeSelector: {}
+
+priorityClassName: system-node-critical
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+
+# OpenCost custom cost plugin sidecar.
+opencostPlugin:
+  enabled: false
+  image:
+    repository: ghcr.io/tollwing/tollwing-opencost-plugin
+    tag: ""
+    pullPolicy: IfNotPresent
+  tollwingAPI: "http://tollwing-server:8080"
+  port: 9992
+  resources:
+    limits:
+      cpu: 100m
+      memory: 64Mi
+    requests:
+      cpu: 10m
+      memory: 32Mi
+
+imagePullSecrets: []

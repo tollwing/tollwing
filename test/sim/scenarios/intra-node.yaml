@@ -1,0 +1,30 @@
+name: intra-node
+description: >
+  Same-host pod-to-pod traffic — the kernel never put it on the wire. Classified
+  intra_node and always $0, kept distinct from same_zone so operators get a direct
+  measurement of co-location quality.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  worker:
+    zone: us-east-1a
+    namespace: batch
+  local-cache:
+    zone: us-east-1a
+    namespace: batch
+traffic:
+  - from: worker
+    to: local-cache
+    intraNode: true
+    requests: 1048576
+    requestBytes: 1024
+    responseBytes: 0
+expect:
+  edges:
+    - from: worker
+      to: local-cache
+      type: intra_node
+      costUSD: 0

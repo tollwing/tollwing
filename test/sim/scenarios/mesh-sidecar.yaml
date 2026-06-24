@@ -1,0 +1,31 @@
+name: mesh-sidecar-dedup
+description: >
+  The app→sidecar loopback hop inside a meshed pod (Envoy/Linkerd). Marked
+  service_mesh_internal and always $0 — surfaced as its own class so it never
+  inflates same_zone and so the app→sidecar→remote chain is not double-charged
+  (P5). The sidecar hint wins over zone-based classification.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  app:
+    zone: us-east-1a
+    namespace: shop
+  app-sidecar:
+    zone: us-east-1a
+    namespace: shop
+traffic:
+  - from: app
+    to: app-sidecar
+    sidecar: true
+    requests: 1048576
+    requestBytes: 4096
+    responseBytes: 4096
+expect:
+  edges:
+    - from: app
+      to: app-sidecar
+      type: service_mesh_internal
+      costUSD: 0
