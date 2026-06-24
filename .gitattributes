@@ -1,0 +1,5 @@
+# Vendored / generated eBPF build inputs: exclude from GitHub Linguist language
+# stats so the repo reads as Go (its actual primary language) rather than C,
+# which the multi-MB generated vmlinux BTF headers would otherwise dominate.
+vmlinux/** linguist-generated
+include/bpf/** linguist-vendored
