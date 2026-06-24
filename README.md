@@ -1,6 +1,7 @@
 # Tollwing
 
 [![CI](https://github.com/tollwing/tollwing/actions/workflows/ci.yml/badge.svg)](https://github.com/tollwing/tollwing/actions/workflows/ci.yml)
+[![Website](https://img.shields.io/badge/website-tollwing.com-0a7ea4)](https://tollwing.com)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/tollwing/tollwing?sort=semver)](https://github.com/tollwing/tollwing/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/tollwing/tollwing)](https://goreportcard.com/report/github.com/tollwing/tollwing)
