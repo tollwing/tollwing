@@ -37,10 +37,10 @@ func main() {
 func header() {
 	fmt.Print(`
   ┌────────────────────────────────────────────────────────────────────────┐
-  │  Tollwing — per-pod Kubernetes network cost, by AWS billing path         │
+  │  Tollwing · per-pod Kubernetes network cost, by AWS billing path         │
   └────────────────────────────────────────────────────────────────────────┘
 
-  Pricing real traffic scenarios through the production cost engine — pure Go,
+  Pricing real traffic scenarios through the production cost engine, pure Go,
   no cloud account, no cluster, no kernel. Every dollar below is bytes ×
   dated-rate (traceable, never estimated), and an independent oracle re-derives
   each one in ` + "`make sim`" + `.
@@ -75,7 +75,7 @@ func differentiator() bool {
      %s [%s/%s]  ──%s──▶  %s%s [%s/%s]
 
   %s dials the %s ClusterIP, which kube-proxy DNATs to a backend pod in
-  a different AZ — so every byte is cross-AZ at %s/GiB. Tollwing recovers the
+  a different AZ, so every byte is cross-AZ at %s/GiB. Tollwing recovers the
   pre-DNAT intent, and the backend-node agent prices the cross-AZ movement once:
 
         billing path     attributed to     cost
@@ -84,8 +84,8 @@ func differentiator() bool {
         total                              %s
 
   Post-DNAT-only tools (Kubecost / OpenCost) see only the rewritten destination
-  IP, so they bill this to %s, or miss it. That blind spot is the gap Tollwing
-  closes, reproduced head-to-head by `+"`make sim-differential`"+`.
+  IP, so they bill this to %s, or miss it. That structural blind spot is the gap
+  Tollwing closes.
 `,
 		r.From, src.Namespace, src.Zone, data(gib), r.To, clusterIP, dst.Namespace, dst.Zone,
 		r.From, r.To, money(perGiB),
@@ -129,12 +129,13 @@ func breadth() {
 func footer() {
 	fmt.Print(`
   ──────────────────────────────────────────────────────────────────────────
-  Same engine, on your cluster — one Helm install, no app changes, ~0.1% CPU:
+  Same engine, on your cluster. One Helm install, no app changes, ~0.1% CPU:
 
       helm install tollwing-agent ./deploy/helm/tollwing-agent \
         --set agent.provider=aws --set agent.region=us-east-1
 
-  Then:  tollwing-cli -server http://tollwing-server:8080 -hours 24
+  The agent then exposes tollwing_* Prometheus metrics on :9990/metrics; point
+  Prometheus at it and import the 23-panel Grafana dashboard. No server needed.
   Verify every number independently:  make sim     Full design: ARCHITECTURE.md
 
 `)
