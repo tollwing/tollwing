@@ -24,6 +24,44 @@ jobs:
       - name: No blocking constitutional violations
         run: go run ./tools/governance scan -gate
 
+  # Leak-guard — the public repo self-defends: fail if any private/Enterprise
+  # package, binary, or marker ever lands here, no matter how it got in
+  # (belt-and-suspenders to the allow-list publish in the private monorepo).
+  oss-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: No private packages / binaries / markers in the OSS tree
+        run: |
+          fail=0
+          for p in api storage auth license; do
+            [ -d "pkg/$p" ] && { echo "LEAK: pkg/$p present"; fail=1; }
+          done
+          for c in gcp azure; do [ -d "pkg/cloud/$c" ] && { echo "LEAK: pkg/cloud/$c present"; fail=1; }; done
+          for b in tollwing-server tollwing-cli tollwing-license tollwing-mcp tollwing-slack tollwing-admission; do
+            [ -d "cmd/$b" ] && { echo "LEAK: cmd/$b present"; fail=1; }
+          done
+          if grep -rlE '//go:build[^\n]*enterprise|//oss:strip' --include='*.go' . >/dev/null 2>&1; then
+            echo "LEAK: enterprise build-tag or //oss:strip marker survived"; grep -rnE '//go:build[^\n]*enterprise|//oss:strip' --include='*.go' . | head; fail=1
+          fi
+          if grep -rnE '\b(GPURequest|PodsWithGPU)\b' --include='*.go' . >/dev/null 2>&1; then
+            echo "LEAK: private GPU symbol present"; fail=1
+          fi
+          [ "$fail" = 0 ] && echo "oss-guard: clean — no private code in the public tree"
+          exit $fail
+
+  # Secret scan — no credentials/keys in the public tree (public repos are free).
+  secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
   lint:
     runs-on: ubuntu-24.04
     steps:
