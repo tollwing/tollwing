@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.14
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.297.0
 	github.com/aws/aws-sdk-go-v2/service/pricing v1.41.0
-	github.com/cilium/ebpf v0.22.0
+	github.com/cilium/ebpf v0.22.0 // keep >= v0.20: earlier versions swallowed per-CPU batch errors into (0,nil) → silent flow loss (see pkg/poller probeBatchSupport)
 	github.com/nats-io/nats.go v1.52.0
 	golang.org/x/net v0.51.0
 	k8s.io/api v0.34.9

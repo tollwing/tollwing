@@ -417,6 +417,14 @@ func possibleCPUs(log *slog.Logger) int {
 // count so the flat per-CPU buffer has the shape cilium/ebpf requires —
 // a mis-shaped buffer fails unmarshalling and masquerades as "batch
 // unsupported" (which is exactly the bug that kept the batch path dead).
+//
+// REGRESSION GUARD (P4): flow_aggregates is a PERCPU_HASH, and cilium/ebpf
+// < v0.20 had a bug where batchLookupPerCPU swallowed the syscall error into
+// (0, nil) on a kernel lacking the batch API. That made this probe wrongly
+// report support, so pollBatch returned zero flows every tick with no error —
+// silent flow loss while logging that batch works. go.mod pins a version where
+// batchLookupPerCPU returns the real sysErr (map.go: `return 0, sysErr`); do
+// NOT downgrade cilium/ebpf below that or this probe goes blind again.
 func probeBatchSupport(m *ebpf.Map, numCPU int) (supported bool, unexpected error) {
 	keys := make([]bpf.FlowKey, 1)
 	// Flat batch×numCPU buffer — see the batchValues field comment.
