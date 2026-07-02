@@ -129,10 +129,11 @@ func (p PromSource) query(ctx context.Context, client *http.Client, q string) ([
 			return nil, fmt.Errorf("parse sample value %q: %w", vs, err)
 		}
 		// increase()/rate() over a counter reset (an agent pod restart) can
-		// yield NaN or ±Inf, which Prometheus serialises as "NaN"/"+Inf" and
-		// ParseFloat accepts. A non-finite value is not a real dollar (P4), so
-		// drop the sample rather than poison the sum or crash the report.
-		if math.IsNaN(v) || math.IsInf(v, 0) {
+		// yield NaN, ±Inf, or a small negative from extrapolation. None of
+		// those is a real dollar (P4: cost is metered bytes × a non-negative
+		// rate), so drop the sample rather than poison the sum, understate the
+		// total, or crash the report.
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
 			continue
 		}
 		out = append(out, sample{Metric: r.Metric, Value: v})

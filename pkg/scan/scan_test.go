@@ -231,8 +231,8 @@ func TestAnalyze_VPCEndpointIsNotAddressable(t *testing.T) {
 	}
 }
 
-func TestPromSource_DropsNonFiniteSamples(t *testing.T) {
-	// A counter reset makes increase() emit NaN/+Inf, serialized as quoted
+func TestPromSource_DropsInvalidSamples(t *testing.T) {
+	// increase() over a counter reset can emit NaN/+Inf/negative samples,
 	// strings. They must be dropped at ingest, not summed or crash the report.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("query")
@@ -240,7 +240,8 @@ func TestPromSource_DropsNonFiniteSamples(t *testing.T) {
 			w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[
 				{"metric":{"traffic_type":"cross_az"},"value":[1710000000,"10.0"]},
 				{"metric":{"traffic_type":"nat_gateway"},"value":[1710000000,"NaN"]},
-				{"metric":{"traffic_type":"internet_egress"},"value":[1710000000,"+Inf"]}
+				{"metric":{"traffic_type":"internet_egress"},"value":[1710000000,"+Inf"]},
+				{"metric":{"traffic_type":"vpc_peering"},"value":[1710000000,"-3.5"]}
 			]}}`))
 			return
 		}
@@ -259,6 +260,9 @@ func TestPromSource_DropsNonFiniteSamples(t *testing.T) {
 	}
 	if _, ok := byPath["internet_egress"]; ok {
 		t.Errorf("+Inf internet_egress sample not dropped: %+v", byPath)
+	}
+	if _, ok := byPath["vpc_peering"]; ok {
+		t.Errorf("negative vpc_peering sample not dropped: %+v", byPath)
 	}
 	// The finite report must render without panicking, and totals stay finite.
 	rep := Analyze(byPath, pods, 24*time.Hour)

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -115,7 +116,13 @@ func New(cfg Config, flowAggMap *ebpf.Map, handler Handler, log *slog.Logger) *P
 
 	// Probe batch support. BatchLookupAndDelete requires kernel 5.6+.
 	if flowAggMap != nil {
-		p.useBatch = probeBatchSupport(flowAggMap, p.numCPU)
+		supported, unexpected := probeBatchSupport(flowAggMap, p.numCPU)
+		if unexpected != nil {
+			// Not a plain "old kernel" — surface it rather than silently
+			// running the slower fallback for the life of the process.
+			log.Warn("batch-support probe hit an unexpected error; using Iterate fallback (may be slower)", "err", unexpected)
+		}
+		p.useBatch = supported
 		if p.useBatch {
 			log.Info("poller using BatchLookupAndDelete (kernel 5.6+)")
 		} else {
@@ -410,17 +417,35 @@ func possibleCPUs(log *slog.Logger) int {
 // count so the flat per-CPU buffer has the shape cilium/ebpf requires —
 // a mis-shaped buffer fails unmarshalling and masquerades as "batch
 // unsupported" (which is exactly the bug that kept the batch path dead).
-func probeBatchSupport(m *ebpf.Map, numCPU int) bool {
+func probeBatchSupport(m *ebpf.Map, numCPU int) (supported bool, unexpected error) {
 	keys := make([]bpf.FlowKey, 1)
 	// Flat batch×numCPU buffer — see the batchValues field comment.
 	values := make([]bpf.FlowMetrics, 1*numCPU)
 
 	var cursor ebpf.MapBatchCursor
 	_, err := m.BatchLookup(&cursor, keys, values, nil)
-	// ErrKeyNotExist means batch is supported but map is empty — that's fine.
-	// ErrNotSupported or EINVAL means batch ops aren't available.
-	if err == nil || errors.Is(err, ebpf.ErrKeyNotExist) {
-		return true
+	return classifyBatchProbe(err)
+}
+
+// classifyBatchProbe interprets a BatchLookup probe result. It returns whether
+// batch ops are supported, and a non-nil UNEXPECTED error only when the probe
+// failed for a reason that is neither "supported" nor a known "unavailable on
+// this kernel" signal. The old code collapsed every non-nil error into "not
+// supported", so a genuine problem (a permissions failure, a map-type
+// mismatch) was silently masked as "old kernel" and the poller ran the slower,
+// lossier Iterate fallback forever with nothing in the logs. Here the caller
+// still falls back on an unexpected error (safe default) but logs it.
+func classifyBatchProbe(err error) (supported bool, unexpected error) {
+	switch {
+	case err == nil, errors.Is(err, ebpf.ErrKeyNotExist):
+		// Supported — ErrKeyNotExist just means the map is empty.
+		return true, nil
+	case errors.Is(err, ebpf.ErrNotSupported),
+		errors.Is(err, syscall.EINVAL),
+		errors.Is(err, syscall.EOPNOTSUPP):
+		// Genuinely unavailable (< kernel 5.6) — fall back, nothing to report.
+		return false, nil
+	default:
+		return false, err
 	}
-	return false
 }
