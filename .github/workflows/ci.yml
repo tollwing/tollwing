@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded in-progress runs on the same ref, so a rapid series of
+# pushes doesn't pile up N full CI runs — only the latest commit's run finishes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   GO_VERSION: "1.24"
 
@@ -70,10 +76,13 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       # go vet walks the go:embed of the compiled BPF objects, so compile first.
-      - name: Install LLVM toolchain
+      - name: Ensure LLVM toolchain (skip install if the runner already has clang)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm
+          if command -v clang >/dev/null && command -v llvm-strip >/dev/null; then
+            echo "clang + llvm-strip already present: $(clang --version | head -1)"
+          else
+            sudo apt-get update && sudo apt-get install -y clang llvm
+          fi
       - name: Compile BPF
         run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
       - name: Go vet
@@ -91,10 +100,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Install LLVM toolchain
+      - name: Ensure LLVM toolchain (skip install if the runner already has clang)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm
+          if command -v clang >/dev/null && command -v llvm-strip >/dev/null; then
+            echo "clang + llvm-strip already present: $(clang --version | head -1)"
+          else
+            sudo apt-get update && sudo apt-get install -y clang llvm
+          fi
       - name: Compile BPF
         run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
       - name: Run tests (race detector)
@@ -121,10 +133,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Install LLVM toolchain
+      - name: Ensure LLVM toolchain (skip install if the runner already has clang)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm
+          if command -v clang >/dev/null && command -v llvm-strip >/dev/null; then
+            echo "clang + llvm-strip already present: $(clang --version | head -1)"
+          else
+            sudo apt-get update && sudo apt-get install -y clang llvm
+          fi
       - name: Compile BPF (x86 + arm64)
         run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
       - name: Verify BPF objects (hooks present)

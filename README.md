@@ -56,7 +56,7 @@ make scan-demo                                                    # synthetic, n
      internet_egress             $363.00      18%
 ```
 
-Free and Apache-2.0, reads only the agent's metrics (`--json` for machine output). The per-connection detail and cost-savings reports are [Tollwing Enterprise](#open-core).
+Free and Apache-2.0, reads only the agent's metrics (`--json` for machine output). Long-term history, multi-cluster rollups, and the Cost Savings Report are **Tollwing Enterprise** — see [Open-core: free vs Tollwing Enterprise](#open-core-free-vs-tollwing-enterprise) for the full split.
 
 ## How it compares
 
@@ -82,7 +82,7 @@ helm install tollwing-agent ./deploy/helm/tollwing-agent \
 
 The agent auto-detects provider + region via IMDS, and exposes `tollwing_*` Prometheus metrics on `:9990/metrics`. Point your Prometheus at it and import the 23-panel Grafana dashboard (`test/local/grafana-dashboard.json`). That is the complete live, single-cluster view, with no extra backend to run.
 
-The control-plane server (long-term history, multi-cluster aggregation, REST API, CLI, alerts, and the premium analytics) is **Tollwing Enterprise**. See [Open-core](#open-core).
+The control-plane server (long-term history, multi-cluster aggregation, REST API, CLI, alerts, and the premium analytics) is **Tollwing Enterprise**. See [Open-core: free vs Tollwing Enterprise](#open-core-free-vs-tollwing-enterprise).
 
 ## How it works: the part post-DNAT tools structurally miss
 
@@ -90,7 +90,7 @@ Tollwing captures each connection's destination **before kube-proxy DNAT** (via 
 
 Outputs: `tollwing_*` Prometheus metrics, the 23-panel Grafana dashboard, and a standalone **FOCUS-aligned JSON cost-export** sidecar (`opencost-plugin/`) for external cost tooling.
 
-## Open-core
+## Open-core: free vs Tollwing Enterprise
 
 The agent that attributes the cost is free and Apache-2.0, and runs standalone: it exposes Prometheus metrics your Grafana reads directly, with no control-plane server. **Tollwing Enterprise** (early access) adds the self-hosted, license-gated control plane on top of the same agent, via an offline signed license (no phone-home). It is not a hosted service:
 
