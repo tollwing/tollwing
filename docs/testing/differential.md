@@ -98,6 +98,15 @@ live. Echo's ClusterIP was `10.96.14.74`, its backend pod on `worker2`/`us-east-
 the clients on `worker`/`us-east-1a`. Every byte is genuine cross-AZ. No longer a
 deferred follow-up — these are the literal numbers.
 
+> **Re-verified 2026-07-03** on the same L2b substrate and the same pinned
+> competitor versions (OpenCost 2.5.22, Kubecost daemon v0.17.6) — the verdict is
+> unchanged. Tollwing: `cross_az = 193,773,088 bytes → $0.001994`, attributed to
+> the dialed `echo` Service. OpenCost: `$0.000000` (still ships no network
+> daemon). Kubecost: the cross-AZ Service traffic is labelled `same_zone=free`,
+> source-pod-only, naming the dialed Service `0/1` times. Byte and dollar totals
+> vary run-to-run with traffic volume — the *attribution* difference is the
+> point, and it is stable. Reproduce end to end with `make sim-differential`.
+
 ### Tollwing — correct, zero-config
 
 ```
