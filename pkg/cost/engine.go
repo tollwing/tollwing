@@ -54,21 +54,68 @@ type CostResult struct {
 	CostUSD float64
 }
 
+// PricingMode selects how multi-tier (free-allowance) rates are applied
+// (DEC-014).
+type PricingMode int
+
+const (
+	// PricingModeMarginal is the default: every metered GB is priced at
+	// the marginal (post-free-tier) list rate. Per DEC-014 this is the
+	// only honest option for a distributed fleet — per-process cumulative
+	// tier state would grant the account-wide free tier once per engine
+	// and reset the meter on every restart (P5: never guess the account's
+	// tier position).
+	PricingModeMarginal PricingMode = iota
+
+	// PricingModeSingleMeter applies the full tier table with cumulative
+	// in-memory tracking. Valid ONLY when exactly one engine meters the
+	// whole account's traffic (the Enterprise server's aggregation path).
+	// The meter is per-process and resets on restart — mid-month restarts
+	// re-grant the free tier (DEC-014 records this limitation).
+	PricingModeSingleMeter
+)
+
+// EngineConfig controls cost calculation.
+type EngineConfig struct {
+	// Mode selects the tier-handling strategy. The zero value is
+	// PricingModeMarginal, the honest default for distributed agents
+	// (DEC-014).
+	Mode PricingMode
+}
+
+func (c *EngineConfig) setDefaults() {
+	// PricingModeMarginal is the zero value — nothing to fill; the method
+	// exists to keep the Config+setDefaults idiom and a place for future
+	// fields.
+}
+
 // Engine calculates costs for classified network flows.
 type Engine struct {
 	store *RateCardStore
+	cfg   EngineConfig
 
 	// Cumulative byte counters per traffic type for tiered pricing.
+	// Only maintained in PricingModeSingleMeter (DEC-014).
 	// Key: "provider:region:trafficType"
 	mu              sync.Mutex
 	cumulativeBytes map[string]float64
 	resetTime       time.Time // start of current billing period
 }
 
-// NewEngine creates a cost calculation engine.
+// NewEngine creates a cost calculation engine in the default
+// PricingModeMarginal (DEC-014).
 func NewEngine(store *RateCardStore) *Engine {
+	return NewEngineWithConfig(store, EngineConfig{})
+}
+
+// NewEngineWithConfig creates a cost calculation engine with an explicit
+// pricing mode. The Enterprise server's single aggregation engine opts into
+// PricingModeSingleMeter here (DEC-014).
+func NewEngineWithConfig(store *RateCardStore, cfg EngineConfig) *Engine {
+	cfg.setDefaults()
 	return &Engine{
 		store:           store,
+		cfg:             cfg,
 		cumulativeBytes: make(map[string]float64),
 		resetTime:       startOfMonth(time.Now()),
 	}
@@ -97,37 +144,56 @@ func (e *Engine) Calculate(provider, region string, flows []FlowRecord) []CostRe
 	return results
 }
 
-// calculateFlow computes the cost for a single flow.
+// calculateFlow computes the cost for a single flow. Billable bytes are
+// selected by the card's per-traffic-type metered-direction table (DEC-014);
+// blanket Tx+Rx metering previously billed ingress at egress rates.
 func (e *Engine) calculateFlow(card *RateCard, flow FlowRecord) float64 {
-	totalBytes := float64(flow.TxBytes + flow.RxBytes)
-	totalGB := totalBytes / (1024 * 1024 * 1024)
+	meteredGB := bytesToGB(card.MeteredBytes(flow.TrafficType, flow.TxBytes, flow.RxBytes))
 
 	switch flow.TrafficType {
 	case classifier.NATGatewayEgress:
-		return totalGB * card.NATGateway.PerGBUSD
+		// Per DEC-015: an internet-bound flow through a NAT gateway incurs
+		// BOTH the NAT data-processing charge (on the metered directions)
+		// and the internet-egress charge on the Tx leg — the bytes still
+		// leave the cloud after the NAT. The NAT hourly charge is
+		// deliberately not per-flow (P4: bytes × dated-rate only); it
+		// surfaces in reconciliation's unaccounted bucket.
+		cost := meteredGB * card.NATGateway.PerGBUSD
+		if rate, ok := card.Rates[classifier.InternetEgress]; ok {
+			cost += e.priceTiered(card.Provider, card.Region, classifier.InternetEgress, rate, bytesToGB(flow.TxBytes))
+		}
+		return cost
 	case classifier.TransitGateway:
-		return totalGB * card.TransitGW.PerGBUSD
+		// Per-attachment-hour is not per-flow (DEC-015).
+		return meteredGB * card.TransitGW.PerGBUSD
 	default:
 		rate, ok := card.Rates[flow.TrafficType]
 		if !ok {
 			return 0
 		}
-		return e.calculateTiered(card.Provider, card.Region, flow.TrafficType, rate, totalGB)
+		return e.priceTiered(card.Provider, card.Region, flow.TrafficType, rate, meteredGB)
 	}
 }
 
-// calculateTiered applies tiered pricing with cumulative tracking.
-func (e *Engine) calculateTiered(provider, region string, tt classifier.TrafficType, rate TieredRate, gb float64) float64 {
+// priceTiered prices gb of a traffic type according to the engine's pricing
+// mode (DEC-014).
+func (e *Engine) priceTiered(provider, region string, tt classifier.TrafficType, rate TieredRate, gb float64) float64 {
 	if len(rate.Tiers) == 0 {
 		return 0
 	}
 
-	// Simple flat rate (single tier).
+	// Simple flat rate (single tier) — mode-independent.
 	if len(rate.Tiers) == 1 {
 		return gb * rate.Tiers[0].PerGB
 	}
 
-	// Multi-tier: track cumulative usage for the billing period.
+	// Per DEC-014: the default mode prices at the marginal post-free-tier
+	// list rate — no per-process cumulative fiction.
+	if e.cfg.Mode == PricingModeMarginal {
+		return gb * rate.MarginalRate()
+	}
+
+	// Single-meter mode: track cumulative usage for the billing period.
 	key := provider + ":" + region + ":" + tt.String()
 
 	e.mu.Lock()
@@ -143,6 +209,12 @@ func (e *Engine) calculateTiered(provider, region string, tt classifier.TrafficT
 	e.mu.Unlock()
 
 	return tieredCost(rate.Tiers, prevGB, prevGB+gb)
+}
+
+// bytesToGB converts a byte count to the GiB-based "GB" unit the rate tables
+// use throughout pkg/cost.
+func bytesToGB(b uint64) float64 {
+	return float64(b) / (1024 * 1024 * 1024)
 }
 
 // tieredCost calculates cost for GB consumed between prevGB and newGB

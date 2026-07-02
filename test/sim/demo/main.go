@@ -129,7 +129,8 @@ func breadth() {
 func footer() {
 	fmt.Print(`
   ──────────────────────────────────────────────────────────────────────────
-  Same engine, on your cluster. One Helm install, no app changes, ~0.1% CPU:
+  Same engine, on your cluster. One Helm install, no app changes, and an
+  overhead budget of 0.1-0.5% of one core (ARCHITECTURE.md §2.4):
 
       helm install tollwing-agent ./deploy/helm/tollwing-agent \
         --set agent.provider=aws --set agent.region=us-east-1

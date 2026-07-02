@@ -188,6 +188,180 @@ func TestClassify_UnknownWhenNoZones(t *testing.T) {
 	}
 }
 
+// TestClassify_RFC1918PeeringAndTGW is the regression test for the $0 peering
+// bug: real VPC peers and TGW attachments are almost always RFC 1918, and the
+// old decision order sent every private destination into the zone-based path
+// before consulting the peering/TGW prefix sets — peered flows resolved no
+// zone, fell to Unknown, and the engine priced them at $0. Per P5, the prefix
+// sets must win for private, non-cluster destinations.
+func TestClassify_RFC1918PeeringAndTGW(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(c *Classifier)
+		dst      string
+		expected TrafficType
+	}{
+		{
+			name: "RFC1918 peer CIDR classifies vpc_peering",
+			setup: func(c *Classifier) {
+				c.SetVPCPeeringCIDRs([]netip.Prefix{netip.MustParsePrefix("10.50.0.0/16")})
+			},
+			dst:      "10.50.1.10",
+			expected: VPCPeering,
+		},
+		{
+			name: "RFC1918 TGW CIDR classifies transit_gateway",
+			setup: func(c *Classifier) {
+				c.SetTransitGatewayCIDRs([]netip.Prefix{netip.MustParsePrefix("172.16.0.0/12")})
+			},
+			dst:      "172.16.5.10",
+			expected: TransitGateway,
+		},
+		{
+			name: "RFC1918 endpoint CIDR classifies vpc_endpoint",
+			setup: func(c *Classifier) {
+				c.SetVPCEndpointCIDRs([]netip.Prefix{netip.MustParsePrefix("10.60.0.0/24")})
+			},
+			dst:      "10.60.0.7",
+			expected: VPCEndpoint,
+		},
+		{
+			name: "NAT IP wins over an enclosing peer CIDR",
+			setup: func(c *Classifier) {
+				c.SetVPCPeeringCIDRs([]netip.Prefix{netip.MustParsePrefix("10.50.0.0/16")})
+				c.SetNATGatewayIPs([]netip.Addr{netip.MustParseAddr("10.50.99.1")})
+			},
+			dst:      "10.50.99.1",
+			expected: NATGatewayEgress,
+		},
+		{
+			name: "cluster CIDR wins over an overlapping peer CIDR",
+			setup: func(c *Classifier) {
+				c.SetVPCPeeringCIDRs([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+				c.SetClusterCIDRs([]netip.Prefix{netip.MustParsePrefix("10.0.2.0/24")})
+			},
+			dst: "10.0.2.20",
+			// Cluster-internal with no zones resolved → Unknown, never
+			// vpc_peering: pod traffic must not be billed as peering.
+			expected: Unknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := New(newTestResolver())
+			tt.setup(c)
+
+			result := c.Classify(FlowInfo{
+				SrcIP: ipToNBO("10.0.1.10"),
+				DstIP: ipToNBO(tt.dst),
+			})
+			if result.Type != tt.expected {
+				t.Fatalf("dst %s: expected %s, got %s", tt.dst, tt.expected, result.Type)
+			}
+		})
+	}
+}
+
+// TestClassify_ReplaceOnRefresh: the topology refresher re-feeds the CIDR
+// sets every few minutes. Each Set* call must REPLACE its category — the old
+// append-only tree grew without bound and kept deleted peerings classifying
+// forever (DEC-015).
+func TestClassify_ReplaceOnRefresh(t *testing.T) {
+	c := New(newTestResolver())
+	flow := FlowInfo{SrcIP: ipToNBO("10.0.1.10"), DstIP: ipToNBO("10.50.1.10")}
+
+	c.SetVPCPeeringCIDRs([]netip.Prefix{netip.MustParsePrefix("10.50.0.0/16")})
+	if got := c.Classify(flow).Type; got != VPCPeering {
+		t.Fatalf("before deletion: expected vpc_peering, got %s", got)
+	}
+
+	// Peering deleted upstream — next refresh delivers an empty set.
+	c.SetVPCPeeringCIDRs(nil)
+	if got := c.Classify(flow).Type; got == VPCPeering {
+		t.Fatalf("deleted peering still classifies vpc_peering (stale prefix tree)")
+	}
+
+	// Other categories must survive a peering-set replacement.
+	c.SetTransitGatewayCIDRs([]netip.Prefix{netip.MustParsePrefix("172.16.0.0/12")})
+	c.SetVPCPeeringCIDRs([]netip.Prefix{netip.MustParsePrefix("10.70.0.0/16")})
+	tgwFlow := FlowInfo{SrcIP: ipToNBO("10.0.1.10"), DstIP: ipToNBO("172.16.5.10")}
+	if got := c.Classify(tgwFlow).Type; got != TransitGateway {
+		t.Fatalf("TGW set lost after peering refresh: got %s", got)
+	}
+
+	// Repeated refreshes with the same set must not grow the tree.
+	for i := 0; i < 100; i++ {
+		c.SetVPCPeeringCIDRs([]netip.Prefix{netip.MustParsePrefix("10.70.0.0/16")})
+	}
+	c.mu.RLock()
+	size := c.prefixTree.Len()
+	c.mu.RUnlock()
+	if size != 2 { // 1 peering + 1 TGW
+		t.Fatalf("prefix tree grew to %d entries after repeated refreshes, want 2", size)
+	}
+}
+
+// TestClassify_DefaultRouteNAT: route-based NAT detection (DEC-015). An
+// internet-bound flow from a subnet that default-routes through a NAT gateway
+// classifies nat_gateway even though the destination is the internet IP —
+// dst==NAT-ENI matching can never fire for these flows.
+func TestClassify_DefaultRouteNAT(t *testing.T) {
+	c := New(newTestResolver())
+	internetFlow := FlowInfo{SrcIP: ipToNBO("10.0.1.10"), DstIP: ipToNBO("8.8.8.8")}
+
+	// Without route knowledge: internet egress.
+	if got := c.Classify(internetFlow).Type; got != InternetEgress {
+		t.Fatalf("expected internet_egress before route detection, got %s", got)
+	}
+
+	c.SetDefaultRouteNAT(true)
+	if got := c.Classify(internetFlow).Type; got != NATGatewayEgress {
+		t.Fatalf("expected nat_gateway for internet-bound flow behind NAT route, got %s", got)
+	}
+
+	// Known topology prefixes still win over the NAT-route default —
+	// endpoint/peering traffic does not traverse the NAT.
+	c.SetVPCEndpointCIDRs([]netip.Prefix{netip.MustParsePrefix("3.5.0.0/16")})
+	epFlow := FlowInfo{SrcIP: ipToNBO("10.0.1.10"), DstIP: ipToNBO("3.5.1.100")}
+	if got := c.Classify(epFlow).Type; got != VPCEndpoint {
+		t.Fatalf("expected vpc_endpoint to win over NAT route, got %s", got)
+	}
+
+	// NAT gateway removed (e.g. IGW route restored) — back to egress.
+	c.SetDefaultRouteNAT(false)
+	if got := c.Classify(internetFlow).Type; got != InternetEgress {
+		t.Fatalf("expected internet_egress after NAT route removal, got %s", got)
+	}
+}
+
+// TestQualifyAzureZone: Azure IMDS and ARM APIs report bare zone ordinals
+// ("1"); unqualified, regionFromZone treated "1" vs "2" as different REGIONS
+// and cross-AZ flows misclassified as cross_region.
+func TestQualifyAzureZone(t *testing.T) {
+	tests := []struct {
+		region, zone, want string
+	}{
+		{"eastus", "1", "eastus-1"},
+		{"westeurope", "3", "westeurope-3"},
+		{"eastus", "eastus-2", "eastus-2"}, // already qualified
+		{"eastus", "", ""},                 // non-zonal
+		{"", "1", "1"},                     // region unknown — leave as-is
+	}
+	for _, tt := range tests {
+		if got := QualifyAzureZone(tt.region, tt.zone); got != tt.want {
+			t.Errorf("QualifyAzureZone(%q, %q) = %q, want %q", tt.region, tt.zone, got, tt.want)
+		}
+	}
+
+	// The qualified zones must round-trip through regionFromZone so two
+	// zones of one region compare as the same region (cross_az, not
+	// cross_region).
+	if regionFromZone(QualifyAzureZone("eastus", "1")) != regionFromZone(QualifyAzureZone("eastus", "2")) {
+		t.Error("two qualified zones of eastus must resolve to the same region")
+	}
+}
+
 func TestRegionFromZone(t *testing.T) {
 	tests := []struct {
 		zone, region string

@@ -45,7 +45,7 @@ go run ./tools/governance audit -principle P4
 go run ./tools/governance audit -list
 ```
 
-The generated prompt names the required reading, the scope, the per-principle "look for" hints, the remediation paths, and the output path. Reports land in [`reports/audits/`](../../reports/audits/) as `{type}-{scope}-{YYYY-MM-DD}.md`.
+The generated prompt names the required reading, the scope, the per-principle "look for" hints, the remediation paths, and the output path. Reports land in `reports/audits/` (monorepo) as `{type}-{scope}-{YYYY-MM-DD}.md`.
 
 ---
 

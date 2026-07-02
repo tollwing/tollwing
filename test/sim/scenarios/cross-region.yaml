@@ -1,8 +1,10 @@
 name: cross-region
 description: >
   api in us-east-1 replicates to a service in eu-west-1: cross_region, charged
-  everywhere (and pricier than cross-AZ). 1 GiB at the AWS cross-region rate
-  ($0.02/GiB) = $0.02. Exercises regionFromZone() distinguishing two real regions.
+  everywhere — on the EGRESS side only (inter-region data transfer in is free;
+  DEC-014 metered directions). 1 GiB on the wire (0.5 up + 0.5 down), of which
+  only the 0.5 GiB sent bills at the AWS inter-region rate ($0.02/GiB from
+  us-east-1) = $0.01. Exercises regionFromZone() distinguishing two real regions.
 provider: aws
 region: us-east-1
 zones:
@@ -28,4 +30,4 @@ expect:
     - from: api
       to: replica
       type: cross_region
-      costUSD: 0.02
+      costUSD: 0.01 # 0.5 GiB sent * $0.02/GiB; the 0.5 GiB received is free

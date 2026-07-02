@@ -21,6 +21,7 @@ func newTestInformer() *Informer {
 		nodeZones:         make(map[string]string),
 		nodeInstanceTypes: make(map[string]string),
 		podCIDRs:          make(map[string]struct{}),
+		endpointsBySlice:  make(map[string][]sliceEndpointEntry),
 	}
 }
 

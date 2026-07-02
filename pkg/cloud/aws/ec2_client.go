@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
 // SDKClient implements ec2Client using the AWS SDK v2.
@@ -133,6 +135,50 @@ func (c *SDKClient) DescribeTransitGatewayAttachments(ctx context.Context) ([]ec
 		}
 	}
 	return attachments, nil
+}
+
+// DescribeRouteTables lists route tables, server-side filtered to vpcID when
+// non-empty: route-based NAT detection (DEC-015) must only ever see this
+// node's VPC — another VPC's main table must not decide this node's NAT flag.
+func (c *SDKClient) DescribeRouteTables(ctx context.Context, vpcID string) ([]ec2RouteTable, error) {
+	input := &ec2.DescribeRouteTablesInput{}
+	if vpcID != "" {
+		input.Filters = []types.Filter{{
+			Name:   aws.String("vpc-id"),
+			Values: []string{vpcID},
+		}}
+	}
+
+	var tables []ec2RouteTable
+	paginator := ec2.NewDescribeRouteTablesPaginator(c.client, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("ec2 DescribeRouteTables: %w", err)
+		}
+		for _, rt := range page.RouteTables {
+			table := ec2RouteTable{
+				RouteTableID: deref(rt.RouteTableId),
+				VpcID:        deref(rt.VpcId),
+			}
+			for _, assoc := range rt.Associations {
+				a := ec2RTAssociation{SubnetID: deref(assoc.SubnetId)}
+				if assoc.Main != nil {
+					a.Main = *assoc.Main
+				}
+				table.Associations = append(table.Associations, a)
+			}
+			for _, r := range rt.Routes {
+				table.Routes = append(table.Routes, ec2Route{
+					DestinationCidrBlock: deref(r.DestinationCidrBlock),
+					GatewayID:            deref(r.GatewayId),
+					NatGatewayID:         deref(r.NatGatewayId),
+				})
+			}
+			tables = append(tables, table)
+		}
+	}
+	return tables, nil
 }
 
 // deref safely dereferences a string pointer, returning "" for nil.

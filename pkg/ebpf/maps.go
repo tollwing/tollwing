@@ -11,10 +11,16 @@ import (
 // AgentConfig mirrors struct agent_config in maps.h.
 // Field order, sizes, and padding must be identical.
 type AgentConfig struct {
-	Enabled       uint8
-	TrackUDP      uint8
-	SampleRate    uint8
-	Reserved      [5]uint8
+	Enabled    uint8
+	TrackUDP   uint8
+	SampleRate uint8
+	// UDPSocketTX is the authoritative-source switch for UDP TX bytes:
+	// 1 means the socket path (cgroup/connect4 + fentry/udp_sendmsg) owns
+	// them and the TC QUIC hook records nothing. Computed by the loader
+	// from TrackUDP and the actual udp_sendmsg attach outcome — see
+	// udpSocketTX in loader.go and the rule in bpf/quic.bpf.c.
+	UDPSocketTX   uint8
+	Reserved      [4]uint8
 	AggregationNs uint64
 }
 
@@ -202,24 +208,6 @@ func (e *CloseEvent) OriginalDstAddr() netip.AddrPort {
 		return netip.AddrPort{}
 	}
 	return ipPort(e.OriginalDstIP, e.OriginalDstPort)
-}
-
-// CgroupCostBPF mirrors struct cgroup_cost in maps.h (BPF_MAP_TYPE_CGRP_STORAGE).
-type CgroupCostBPF struct {
-	TxBytes         uint64
-	RxBytes         uint64
-	RetransmitBytes uint64
-	ConnCount       uint64
-}
-
-// SkCostMeta mirrors struct sk_cost_meta in maps.h (BPF_MAP_TYPE_SK_STORAGE).
-type SkCostMeta struct {
-	FK              FlowKey
-	TxBytes         uint64
-	RxBytes         uint64
-	RetransmitBytes uint64
-	CgroupID        uint64
-	StartNs         uint64
 }
 
 // QuicFlowKey mirrors struct quic_flow_key in maps.h.

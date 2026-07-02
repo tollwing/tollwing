@@ -1,0 +1,32 @@
+name: nat-gateway-route
+description: >
+  Route-based NAT detection (DEC-015): the node's subnet default-routes
+  through a NAT gateway, so an internet-bound flow (dst stays the public IP —
+  it never equals the NAT ENI) still classifies nat_gateway and pays NAT
+  data processing + the DTO leg. This is the case IP-based NAT matching can
+  structurally never see. 2 GiB out -> 2 * ($0.045 + $0.09) = $0.27.
+provider: aws
+region: us-east-1
+defaultRouteNAT: true
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  worker:
+    zone: us-east-1a
+    namespace: batch
+external:
+  api-endpoint:
+    ip: 93.184.216.34
+traffic:
+  - from: worker
+    to: api-endpoint
+    requests: 2097152 # 2 * 2^20
+    requestBytes: 1024
+    responseBytes: 0 # 2 GiB
+expect:
+  edges:
+    - from: worker
+      to: api-endpoint
+      type: nat_gateway
+      costUSD: 0.27 # 2 GiB * ($0.045 NAT processing + $0.09 DTO)

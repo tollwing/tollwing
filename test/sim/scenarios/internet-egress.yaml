@@ -1,8 +1,11 @@
-name: internet-egress-tiered
+name: internet-egress-marginal
 description: >
-  A service egresses 5 GiB to the public internet. AWS gives the first 1 GiB/month
-  free, then $0.09/GiB — so 5 GiB = (5-1) * 0.09 = $0.36. Exercises the multi-tier
-  cumulative pricing path end-to-end (the case a flat-rate oracle would get wrong).
+  A service egresses 5 GiB to the public internet, priced in the product's
+  DEFAULT distributed mode (DEC-014): every GiB at the marginal post-free-tier
+  list rate ($0.09/GiB in us-east-1), because a fleet of per-node engines
+  cannot know the account's tier position — granting each node the 100 GB/mo
+  account-wide free tier would under-report fleet dollars. 5 GiB -> $0.45.
+  Ingress from the internet is free (Tx-only metering).
 provider: aws
 region: us-east-1
 zones:
@@ -26,4 +29,4 @@ expect:
     - from: api
       to: internet
       type: internet_egress
-      costUSD: 0.36 # (5 - 1 free) GiB * $0.09/GiB
+      costUSD: 0.45 # 5 GiB * $0.09/GiB marginal rate

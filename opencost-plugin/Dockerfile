@@ -1,4 +1,6 @@
-FROM golang:1.21-alpine AS builder
+# Tollwing cost export sidecar (see README.md and DEC-017: not an
+# OpenCost plugin). Build context is the repo root.
+FROM golang:1.24-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

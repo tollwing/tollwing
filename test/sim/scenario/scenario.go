@@ -33,6 +33,17 @@ type Scenario struct {
 	TransitGatewayCIDRs []string `json:"transitGatewayCIDRs"`
 	VPCEndpointCIDRs    []string `json:"vpcEndpointCIDRs"`
 	ClusterCIDRs        []string `json:"clusterCIDRs"`
+
+	// DefaultRouteNAT marks the node's subnet as default-routing through a
+	// NAT gateway (route-based NAT detection, DEC-015) — fed to the
+	// classifier exactly as the cloud.TopologyRefresher would.
+	DefaultRouteNAT bool `json:"defaultRouteNAT"`
+
+	// PricingMode selects the engine's tier handling (DEC-014):
+	// "" or "marginal" (the product default) prices at the post-free-tier
+	// list rate; "single_meter" opts into cumulative tier tracking, as the
+	// Enterprise server's single aggregation engine does.
+	PricingMode string `json:"pricingMode"`
 }
 
 // Zone is a fake availability zone. At L2 it becomes a node label
@@ -168,6 +179,11 @@ func (s *Scenario) Validate() error {
 				return fmt.Errorf("invalid CIDR %q: %w", c, err)
 			}
 		}
+	}
+	switch s.PricingMode {
+	case "", "marginal", "single_meter":
+	default:
+		return fmt.Errorf("invalid pricingMode %q (want \"\", \"marginal\" or \"single_meter\")", s.PricingMode)
 	}
 	return nil
 }

@@ -37,7 +37,12 @@ int BPF_PROG(tollwing_dns_recvmsg, struct sock *sk)
 		return 0;
 
 	struct sk_buff *skb = BPF_CORE_READ(sk, sk_receive_queue.next);
-	if (!skb)
+	// An empty sk_receive_queue is a circular list whose head points to
+	// itself: `next` is then the embedded list head inside struct sock —
+	// NOT an skb and NOT NULL. At fentry time (before the datagram is
+	// consumed) an empty queue is common; dereferencing the sentinel as an
+	// skb read garbage `data`/`len` fields. Guard against it explicitly.
+	if (!skb || (void *)skb == (void *)&sk->sk_receive_queue)
 		return 0;
 
 	unsigned char *data = BPF_CORE_READ(skb, data);
@@ -47,13 +52,24 @@ int BPF_PROG(tollwing_dns_recvmsg, struct sock *sk)
 
 	struct dns_raw_event *evt;
 	evt = bpf_ringbuf_reserve(&dns_events, sizeof(*evt), 0);
-	if (!evt)
+	if (!evt) {
+		count_drop(DROP_SLOT_DNS_RINGBUF);
 		return 0;
+	}
 
 	__builtin_memset(evt, 0, sizeof(*evt));
-	evt->len = (__u16)dlen;
 
-	if (bpf_probe_read_kernel(evt->data, dlen & (DNS_RAW_MAX - 1), data) < 0) {
+	// Clamp instead of masking: `dlen & (DNS_RAW_MAX - 1)` mapped a
+	// full-size 512-byte payload to a 0-byte copy while evt->len still
+	// claimed 512. The range check above already bounds dlen to
+	// [12, DNS_RAW_MAX]; the explicit clamp keeps the verifier's bound
+	// obvious and survives future edits to the check.
+	__u32 copy_len = dlen;
+	if (copy_len > DNS_RAW_MAX)
+		copy_len = DNS_RAW_MAX;
+	evt->len = (__u16)copy_len;
+
+	if (bpf_probe_read_kernel(evt->data, copy_len, data) < 0) {
 		bpf_ringbuf_discard(evt, 0);
 		return 0;
 	}

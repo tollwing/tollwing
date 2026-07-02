@@ -61,7 +61,8 @@ func TestConnInfo_Size(t *testing.T) {
 }
 
 func TestAgentConfig_Size(t *testing.T) {
-	// AgentConfig: 1+1+1+5+8 = 16
+	// AgentConfig: 1+1+1+1+4+8 = 16 (udp_socket_tx took one reserved byte,
+	// so the kernel-side struct agent_config layout is unchanged)
 	if got := unsafe.Sizeof(AgentConfig{}); got != 16 {
 		t.Errorf("AgentConfig size = %d, want 16", got)
 	}

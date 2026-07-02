@@ -1,0 +1,33 @@
+name: internet-egress-single-meter
+description: >
+  The Enterprise single-meter mode (DEC-014): ONE engine meters the whole
+  account, so the tier table applies cumulatively. AWS gives the first
+  100 GB/month free (account-aggregated, since Dec 2021 — not 1 GB), then
+  $0.09/GiB up to 10 TB. 150 GiB from a fresh monthly meter =
+  (150 - 100) * $0.09 = $4.50. Exercises the multi-tier cumulative path and
+  the corrected free-tier boundary end-to-end.
+provider: aws
+region: us-east-1
+pricingMode: single_meter
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  api:
+    zone: us-east-1a
+    namespace: shop
+external:
+  internet:
+    ip: 8.8.8.8
+traffic:
+  - from: api
+    to: internet
+    requests: 157286400 # 150 * 2^20
+    requestBytes: 1024
+    responseBytes: 0 # total = 150 GiB
+expect:
+  edges:
+    - from: api
+      to: internet
+      type: internet_egress
+      costUSD: 4.50 # first 100 GiB free, next 50 GiB * $0.09

@@ -4,7 +4,7 @@
 //   1. cgroup/connect4  — pre-DNAT destination capture (the key differentiator)
 //   2. sock_ops         — connection lifecycle (establish, close)
 //   3. kprobe/tcp_sendmsg + tcp_cleanup_rbuf — byte counting
-//   4. fentry/nf_conntrack_confirm — NAT mapping resolution              [TODO]
+//   4. cgroup/sock_release — connection-table cleanup (UDP has no close CB)
 //
 // CO-RE: compiles against vmlinux headers for kernel portability.
 // Kernel requirement: 5.8+ for cgroup/sock_ops BPF programs + ringbuf.
@@ -23,12 +23,10 @@
 #define IPPROTO_UDP 17
 #endif
 
-// TCP states we care about for connection close detection.
-// These match the kernel's TCP_* enum values.
+// The TCP state that ends byte accounting. Matches the kernel's TCP_* enum.
+// Only TCP_CLOSE is terminal for us: half-close states (CLOSE_WAIT,
+// FIN_WAIT*) still carry legal application data — see handle_state_change.
 #define TCP_CLOSE        7
-#define TCP_CLOSE_WAIT   8
-#define TCP_FIN_WAIT1   11
-#define TCP_FIN_WAIT2   12
 
 #ifndef AF_INET
 #define AF_INET 2
@@ -58,83 +56,11 @@ static __always_inline bool is_sidecar_port(__u16 port)
 	}
 }
 
-// ============================================================================
-// Helper: update per-cgroup cost accumulator (kernel 6.3+).
-// Uses bpf_cgrp_storage_get() — nop if map doesn't exist on older kernels.
-// ============================================================================
-
-#ifdef BPF_MAP_TYPE_CGRP_STORAGE
-static __always_inline void update_cgroup_cost_tx(struct bpf_sock_ops *skops, __u64 bytes)
-{
-	struct cgroup *cgrp = BPF_CORE_READ(skops, sk, sk_cgrp_data.cgroup);
-	if (!cgrp)
-		return;
-	struct cgroup_cost *cost = bpf_cgrp_storage_get(&cgroup_cost_storage, cgrp, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (cost)
-		__sync_fetch_and_add(&cost->tx_bytes, bytes);
-}
-
-static __always_inline void update_cgroup_cost_rx(struct bpf_sock_ops *skops, __u64 bytes)
-{
-	struct cgroup *cgrp = BPF_CORE_READ(skops, sk, sk_cgrp_data.cgroup);
-	if (!cgrp)
-		return;
-	struct cgroup_cost *cost = bpf_cgrp_storage_get(&cgroup_cost_storage, cgrp, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (cost)
-		__sync_fetch_and_add(&cost->rx_bytes, bytes);
-}
-
-static __always_inline void cgroup_cost_new_conn(struct bpf_sock_ops *skops)
-{
-	struct bpf_sock *sk = skops->sk;
-	if (!sk)
-		return;
-	struct cgroup *cgrp = BPF_CORE_READ(sk, sk_cgrp_data.cgroup);
-	if (!cgrp)
-		return;
-	struct cgroup_cost *cost = bpf_cgrp_storage_get(&cgroup_cost_storage, cgrp, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (cost)
-		__sync_fetch_and_add(&cost->conn_count, 1);
-}
-#else
-__attribute__((unused))
-static __always_inline void update_cgroup_cost_tx(struct bpf_sock_ops *skops, __u64 bytes) {}
-__attribute__((unused))
-static __always_inline void update_cgroup_cost_rx(struct bpf_sock_ops *skops, __u64 bytes) {}
-__attribute__((unused))
-static __always_inline void cgroup_cost_new_conn(struct bpf_sock_ops *skops) {}
-#endif
-
-// ============================================================================
-// Helper: populate sk_cost_storage on connection establish (for BPF iterators).
-// ============================================================================
-
-static __always_inline void populate_sk_cost_meta(struct bpf_sock_ops *skops,
-                                                  struct conn_info *conn)
-{
-	struct bpf_sock *sk = skops->sk;
-	if (!sk)
-		return;
-
-	struct sk_cost_meta *meta;
-	meta = bpf_sk_storage_get(&sk_cost_storage, sk, 0,
-	                          BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (!meta)
-		return;
-
-	meta->fk.src_ip    = conn->src_ip;
-	meta->fk.dst_ip    = conn->dst_ip;
-	meta->fk.src_port  = conn->src_port;
-	meta->fk.dst_port  = conn->dst_port;
-	meta->fk.pid       = conn->pid;
-	meta->fk.protocol  = conn->protocol;
-	meta->fk.direction = conn->direction;
-	meta->tx_bytes     = 0;
-	meta->rx_bytes     = 0;
-	meta->retransmit_bytes = 0;
-	meta->cgroupid     = conn->cgroupid;
-	meta->start_ns     = conn->start_ns;
-}
+// Per DEC-016, the per-cgroup CGRP_STORAGE cost helpers and the
+// sk_cost_storage iterator feed were removed. The CGRP_STORAGE block was
+// guarded by `#ifdef BPF_MAP_TYPE_CGRP_STORAGE` — an enum from vmlinux.h,
+// never a macro — so it compiled out of EVERY build while userspace logged
+// "map not available" as if the kernel lacked support.
 
 // ============================================================================
 // Helper: detect and mark sidecar sockets.
@@ -264,8 +190,10 @@ int tollwing_connect4(struct bpf_sock_addr *ctx)
 
 	struct connect_event *evt;
 	evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
-	if (!evt)
+	if (!evt) {
+		count_drop(DROP_SLOT_EVENTS_RINGBUF);
 		return 1;
+	}
 
 	evt->type               = EVENT_CONNECT;
 	evt->protocol           = proto;
@@ -320,8 +248,10 @@ int tollwing_connect6(struct bpf_sock_addr *ctx)
 
 	struct connect_event *evt;
 	evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
-	if (!evt)
+	if (!evt) {
+		count_drop(DROP_SLOT_EVENTS_RINGBUF);
 		return 1;
+	}
 
 	evt->type               = EVENT_CONNECT;
 	evt->protocol           = proto;
@@ -350,7 +280,7 @@ int tollwing_connect6(struct bpf_sock_addr *ctx)
 //   - Still track in connections map for byte counting.
 //
 // STATE_CB: TCP state transitions.
-//   - Detect close states (CLOSE, CLOSE_WAIT, FIN_WAIT) for final tallying.
+//   - Detect the fully-closed state (TCP_CLOSE) for final tallying.
 //   - Emit close_event and remove from connections map.
 // ============================================================================
 
@@ -422,11 +352,19 @@ static __always_inline void handle_established(struct bpf_sock_ops *skops,
 
 	bpf_map_update_elem(&connections, &cookie, &conn, BPF_ANY);
 
-	// ---- Per-cgroup cost: increment conn_count (kernel 6.3+) ----
-	cgroup_cost_new_conn(skops);
-
-	// ---- Populate sk_cost_storage for BPF iterators (kernel 6.4+) ----
-	populate_sk_cost_meta(skops, &conn);
+	// ---- Arm the STATE_CB callback for this socket ----
+	// The kernel delivers BPF_SOCK_OPS_STATE_CB only to sockets that opt in
+	// via this per-socket flag; without it handle_state_change never runs
+	// and the TCP_CLOSE cleanup below it is dead code (the entry then lives
+	// until sock_release/LRU and the close_event is never emitted). OR into
+	// the existing flags so a future flag user isn't clobbered. The helper
+	// (4.16+) and the flag enum (from the vendored vmlinux headers) both
+	// predate our 5.8 kernel floor, so no runtime guard is needed — and a
+	// preprocessor guard would be wrong anyway: the flag is an enum, never
+	// a macro, so `#ifdef` silently compiles it out (the DEC-016 lesson).
+	bpf_sock_ops_cb_flags_set(skops,
+	                          skops->bpf_sock_ops_cb_flags |
+	                          BPF_SOCK_OPS_STATE_CB_FLAG);
 
 	// ---- Detect and mark sidecar sockets ----
 	detect_sidecar(skops);
@@ -450,15 +388,18 @@ static __always_inline void handle_established(struct bpf_sock_ops *skops,
 			struct flow_metrics fm = {};
 			fm.conn_count = 1;
 			fm.last_updated_ns = now;
-			bpf_map_update_elem(&flow_aggregates, &fk, &fm, BPF_NOEXIST);
+			if (bpf_map_update_elem(&flow_aggregates, &fk, &fm, BPF_NOEXIST))
+				count_drop(DROP_SLOT_FLOW_AGGREGATES);
 		}
 	}
 
 	// ---- Emit establish event ----
 	struct establish_event *evt;
 	evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
-	if (!evt)
+	if (!evt) {
+		count_drop(DROP_SLOT_EVENTS_RINGBUF);
 		return;
+	}
 
 	evt->type               = EVENT_ESTABLISH;
 	evt->direction          = direction;
@@ -483,11 +424,15 @@ static __always_inline void handle_state_change(struct bpf_sock_ops *skops)
 	// args[0] = old state, args[1] = new state
 	int new_state = skops->args[1];
 
-	// Only fire on terminal states.
-	if (new_state != TCP_CLOSE &&
-	    new_state != TCP_CLOSE_WAIT &&
-	    new_state != TCP_FIN_WAIT1 &&
-	    new_state != TCP_FIN_WAIT2)
+	// Only fire on the fully-closed state. Half-close states (CLOSE_WAIT,
+	// FIN_WAIT*) were previously treated as terminal, which deleted the
+	// connection entry while the application could still legally send or
+	// receive (e.g. a server draining its response after the client's FIN)
+	// — those bytes went uncounted. Every socket reaches TCP_CLOSE via
+	// tcp_set_state()/tcp_done() on all paths (including TIME_WAIT, resets,
+	// and timeouts), so deferring loses nothing. Per P5, count until the
+	// connection is actually done.
+	if (new_state != TCP_CLOSE)
 		return;
 
 	__u64 cookie = bpf_get_socket_cookie(skops);
@@ -502,8 +447,10 @@ static __always_inline void handle_state_change(struct bpf_sock_ops *skops)
 	// ---- Emit close event ----
 	struct close_event *evt;
 	evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
-	if (!evt)
+	if (!evt) {
+		count_drop(DROP_SLOT_EVENTS_RINGBUF);
 		goto cleanup;
+	}
 
 	evt->type               = EVENT_CLOSE;
 	evt->direction          = conn->direction;
@@ -608,7 +555,11 @@ static __always_inline void update_flow_aggregate(struct conn_info *conn,
 		new_val.rx_bytes = rx_delta;
 		new_val.conn_count = 1;
 		new_val.last_updated_ns = bpf_ktime_get_ns();
-		bpf_map_update_elem(&flow_aggregates, &key, &new_val, BPF_NOEXIST);
+		// A failed insert (map full, or lost race with another CPU) means
+		// this delta is silently gone — count it so tollwing_map_update_
+		// drops_total tells the truth instead of reading 0 forever (P4).
+		if (bpf_map_update_elem(&flow_aggregates, &key, &new_val, BPF_NOEXIST))
+			count_drop(DROP_SLOT_FLOW_AGGREGATES);
 	}
 }
 
@@ -873,99 +824,57 @@ int BPF_PROG(tollwing_tcp_loss_probe, struct sock *sk)
 }
 
 // ============================================================================
-// Hook 7 (optional): fentry/nf_conntrack_confirm — NAT mapping resolution.
+// Hook 7: cgroup/sock_release — connection-table cleanup (kernel 5.9+).
 //
-// Requires kernel 5.11+ with fentry/fexit support and CONFIG_NF_CONNTRACK.
-// Captures conntrack NAT translations for enhanced DNAT resolution beyond
-// the cgroup/connect4 + sock_ops two-phase correlation.
+// UDP sockets get a `connections` entry in cgroup/connect4 (and a
+// cookie_to_original_dst entry) but never pass through the sock_ops
+// STATE_CB close path, so those entries used to live until LRU eviction —
+// and enough UDP churn evicted LIVE TCP entries, silently ending their
+// byte counting. Per P2 (bounded agent state), delete both entries when
+// the socket is destroyed.
 //
-// If unavailable, the agent gracefully degrades to the two-phase method.
+// TCP entries are deliberately NOT deleted here. The kernel runs
+// INET_SOCK_RELEASE when the fd closes, BEFORE the TCP state machine
+// finishes (FIN_WAIT/LAST_ACK/TIME_WAIT come after), so deleting TCP here
+// would preempt the STATE_CB TCP_CLOSE path for every gracefully closed
+// connection — ending byte/retransmit accounting early and suppressing
+// the close_event (the post-close undercount this hook must not recreate,
+// P5). TCP cleanup belongs to handle_state_change at TCP_CLOSE; a TCP
+// socket that somehow never reaches TCP_CLOSE (e.g. the cb-flags helper
+// failed at establish) leaves one stale entry that the LRU_HASH
+// `connections` map evicts under pressure — bounded state per P2, so the
+// belt-and-braces delete is not worth re-breaking graceful closes for.
 //
-// int nf_conntrack_confirm(struct sk_buff *skb)
+// Deliberately not gated on agent_config.enabled: cleanup must keep
+// running for entries created before a runtime disable.
 // ============================================================================
 
-// Common conntrack NAT resolution logic — shared between fentry and kprobe variants.
-static __always_inline int conntrack_confirm_common(struct sk_buff *skb)
+SEC("cgroup/sock_release")
+int tollwing_sock_release(struct bpf_sock *ctx)
 {
-	struct agent_config *cfg = get_config();
-	if (!cfg)
-		return 0;
-
-	// Read the nf_conntrack entry from the skb.
-	// skb->_nfct holds a pointer to struct nf_conn (low bits are status flags).
-	unsigned long nfct_val;
-	nfct_val = BPF_CORE_READ(skb, _nfct);
-	if (!nfct_val)
-		return 0;
-
-	// Mask off the low 3 bits (nfct status flags) to get the nf_conn pointer.
-	struct nf_conn *ct = (struct nf_conn *)(nfct_val & ~7UL);
-	if (!ct)
-		return 0;
-
-	// Read the original tuple (pre-NAT).
-	struct nf_conntrack_tuple orig;
-	bpf_probe_read_kernel(&orig, sizeof(orig),
-		&ct->tuplehash[0].tuple);
-
-	// Read the reply tuple (post-NAT, reversed direction).
-	struct nf_conntrack_tuple reply;
-	bpf_probe_read_kernel(&reply, sizeof(reply),
-		&ct->tuplehash[1].tuple);
-
-	// Only track IPv4 TCP (IPv6 NAT is rare in Kubernetes).
-	if (orig.src.l3num != AF_INET)
-		return 0;
-
-	__u32 orig_dst_ip   = orig.dst.u3.ip;
-	__u16 orig_dst_port = bpf_ntohs(orig.dst.u.tcp.port);
-	__u32 reply_src_ip  = reply.src.u3.ip;
-	__u16 reply_src_port = bpf_ntohs(reply.src.u.tcp.port);
-
-	// If original destination differs from reply source, NAT occurred.
-	if (orig_dst_ip == reply_src_ip && orig_dst_port == reply_src_port)
-		return 0; // no NAT
-
-	// Build a hash key from the original tuple.
-	__u64 key = ((__u64)orig.src.u3.ip << 32) ^
-		    ((__u64)orig.dst.u3.ip << 16) ^
-		    ((__u64)bpf_ntohs(orig.src.u.tcp.port) << 8) ^
-		    (__u64)orig_dst_port;
-
-	struct nat_mapping mapping = {};
-	mapping.pre_dnat_ip   = orig_dst_ip;
-	mapping.pre_dnat_port = orig_dst_port;
-	mapping.post_dnat_ip  = reply_src_ip;
-	mapping.post_dnat_port = reply_src_port;
-	mapping.timestamp_ns  = bpf_ktime_get_ns();
-
-	bpf_map_update_elem(&nat_mappings, &key, &mapping, BPF_ANY);
-
-	return 0;
+	__u64 cookie = bpf_get_socket_cookie(ctx);
+	if (ctx->protocol != IPPROTO_TCP)
+		bpf_map_delete_elem(&connections, &cookie);
+	// The pre-DNAT correlation entry is safe to drop for every protocol:
+	// for TCP it is consumed (and deleted) at ESTABLISHED_CB, so by
+	// release time it only lingers for connections that never established.
+	bpf_map_delete_elem(&cookie_to_original_dst, &cookie);
+	return 1;
 }
 
-SEC("fentry/nf_conntrack_confirm")
-int BPF_PROG(tollwing_conntrack_confirm, struct sk_buff *skb)
-{
-	return conntrack_confirm_common(skb);
-}
-
-// kprobe fallback — attaches to __nf_conntrack_confirm (module-local symbol).
-// Used when fentry on module functions is unavailable.
-SEC("kprobe/__nf_conntrack_confirm")
-int BPF_KPROBE(tollwing_conntrack_confirm_kprobe, struct sk_buff *skb)
-{
-	return conntrack_confirm_common(skb);
-}
+// Per DEC-016, the conntrack NAT-resolution programs
+// (fentry/nf_conntrack_confirm, kprobe/__nf_conntrack_confirm, and the
+// SEC("netfilter") kfunc variant in conntrack_kfunc.bpf.c) were removed:
+// per-packet work feeding the nat_mappings map that no userspace code ever
+// read, with two writers using incompatible key schemes. Pre-DNAT intent
+// comes from the two-phase capture (DEC-003).
 
 // ============================================================================
 // Additional program modules — included as part of the same compilation unit
 // so they share vmlinux.h, maps.h, and the GPL license.
 // ============================================================================
 
-#include "conntrack_kfunc.bpf.c"
 #include "dns.bpf.c"
-#include "iter.bpf.c"
 #include "quic.bpf.c"
 
 char LICENSE[] SEC("license") = "GPL";

@@ -68,9 +68,9 @@ func (t *TopologyRefresher) NATGateways() []NATGateway {
 
 func (t *TopologyRefresher) refresh(ctx context.Context) {
 	t.refreshNATGateways(ctx)
+	t.refreshNATRoute(ctx)
 	t.refreshVPCPeerings(ctx)
 	t.refreshTransitGateways(ctx)
-	t.refreshServiceCIDRs(ctx)
 	t.refreshSubnetZones(ctx)
 }
 
@@ -95,6 +95,13 @@ func (t *TopologyRefresher) refreshNATGateways(ctx context.Context) {
 	t.log.Info("refreshed NAT gateways", "count", len(gateways))
 }
 
+// localVPCCIDRSource is the optional provider capability to report the local
+// VPC's own address space (currently AWS). The refresher uses it to guard
+// the classifier's peering prefix set against local-CIDR poisoning.
+type localVPCCIDRSource interface {
+	LocalVPCCIDRs(ctx context.Context) ([]netip.Prefix, error)
+}
+
 func (t *TopologyRefresher) refreshVPCPeerings(ctx context.Context) {
 	peerings, err := t.provider.GetVPCPeerings(ctx)
 	if err != nil {
@@ -102,12 +109,55 @@ func (t *TopologyRefresher) refreshVPCPeerings(ctx context.Context) {
 		return
 	}
 
+	localCIDRs := t.localVPCCIDRs(ctx)
+
 	var cidrs []netip.Prefix
 	for _, p := range peerings {
-		cidrs = append(cidrs, p.PeerCIDRs...)
+		for _, cidr := range p.PeerCIDRs {
+			// Belt-and-braces (P5): a "peer" CIDR overlapping the local
+			// VPC's own space is never a real peer (clouds refuse to peer
+			// overlapping VPCs). Letting it into the prefix set repriced
+			// every non-cluster private flow inside the local VPC as
+			// vpc_peering — the classifier consults the peering prefixes
+			// before the zone fallback.
+			if local, overlaps := overlapsAny(cidr, localCIDRs); overlaps {
+				t.log.Warn("dropping peering CIDR overlapping the local VPC",
+					"peering", p.ID, "cidr", cidr.String(), "local_cidr", local.String())
+				continue
+			}
+			cidrs = append(cidrs, cidr)
+		}
 	}
 	t.classifier.SetVPCPeeringCIDRs(cidrs)
 	t.log.Info("refreshed VPC peerings", "peerings", len(peerings), "cidrs", len(cidrs))
+}
+
+// localVPCCIDRs asks the provider for the local VPC's address space, when it
+// can report it. Failure is non-fatal: the guard degrades to a no-op and the
+// provider-side fix (peer-side selection) remains the primary defense.
+func (t *TopologyRefresher) localVPCCIDRs(ctx context.Context) []netip.Prefix {
+	src, ok := t.provider.(localVPCCIDRSource)
+	if !ok {
+		return nil
+	}
+	cidrs, err := src.LocalVPCCIDRs(ctx)
+	if err != nil {
+		t.log.Warn("failed to fetch local VPC CIDRs, peering guard disabled", "err", err)
+		return nil
+	}
+	return cidrs
+}
+
+// overlapsAny reports whether prefix overlaps any of the given prefixes,
+// returning the first overlapping one. Two prefixes overlap iff either
+// contains the other's base address.
+func overlapsAny(prefix netip.Prefix, others []netip.Prefix) (netip.Prefix, bool) {
+	for _, o := range others {
+		if prefix.Contains(o.Addr()) || o.Contains(prefix.Addr()) {
+			return o, true
+		}
+	}
+	return netip.Prefix{}, false
 }
 
 func (t *TopologyRefresher) refreshTransitGateways(ctx context.Context) {
@@ -125,24 +175,34 @@ func (t *TopologyRefresher) refreshTransitGateways(ctx context.Context) {
 	t.log.Info("refreshed transit gateways", "gateways", len(gateways), "cidrs", len(cidrs))
 }
 
-func (t *TopologyRefresher) refreshServiceCIDRs(ctx context.Context) {
-	services, err := t.provider.GetServiceCIDRs(ctx)
-	if err != nil {
-		t.log.Warn("failed to fetch service CIDRs", "err", err)
+// Published service IP ranges (AWS ip-ranges.json, GCP cloud.json, Azure
+// service tags) are deliberately NOT fed into the classifier's VPC-endpoint
+// set. Per DEC-015 (and P5): a public range — including the giant AMAZON/EC2
+// blocks — says nothing about whether THIS VPC has an endpoint for it, and
+// flattening them into SetVPCEndpointCIDRs repriced public-EC2/internet
+// egress (~$0.09/GB) as vpc_endpoint ($0.01/GB). Endpoint CIDRs must come
+// from actually-deployed endpoints (a future DescribeVpcEndpoints feed, or an
+// operator calling classifier.SetVPCEndpointCIDRs directly).
+
+// natRouteDetector is the optional provider capability for route-based NAT
+// detection (DEC-015). Only providers that can inspect their route tables
+// implement it (currently AWS).
+type natRouteDetector interface {
+	NodeRoutesViaNAT(ctx context.Context) (bool, error)
+}
+
+func (t *TopologyRefresher) refreshNATRoute(ctx context.Context) {
+	detector, ok := t.provider.(natRouteDetector)
+	if !ok {
 		return
 	}
-
-	// Flatten all service CIDRs into the VPC endpoint set.
-	// The classifier will match against these to distinguish
-	// VPC endpoint traffic from public internet egress.
-	var endpointCIDRs []netip.Prefix
-	totalCIDRs := 0
-	for _, cidrs := range services {
-		endpointCIDRs = append(endpointCIDRs, cidrs...)
-		totalCIDRs += len(cidrs)
+	viaNAT, err := detector.NodeRoutesViaNAT(ctx)
+	if err != nil {
+		t.log.Warn("failed to detect NAT default route", "err", err)
+		return
 	}
-	t.classifier.SetVPCEndpointCIDRs(endpointCIDRs)
-	t.log.Info("refreshed service CIDRs", "services", len(services), "cidrs", totalCIDRs)
+	t.classifier.SetDefaultRouteNAT(viaNAT)
+	t.log.Info("refreshed NAT route detection", "default_route_via_nat", viaNAT)
 }
 
 func (t *TopologyRefresher) refreshSubnetZones(ctx context.Context) {

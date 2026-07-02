@@ -1,9 +1,12 @@
 name: transit-gateway
 description: >
   Traffic through a Transit Gateway attachment (destination in a registered TGW
-  CIDR). Charged per-GB ($0.02/GiB on AWS); the per-attachment-hour charge is not
-  per-flow cost. 1 GiB → $0.02. (100.64/10 is RFC-6598 shared space — treated as
-  external unless registered as a cluster CIDR.)
+  CIDR). TGW data processing ($0.02/GiB on AWS) bills bytes sent INTO the TGW
+  from this VPC's attachment — the response bytes were processed on the peer
+  attachment's dime (DEC-014 metered directions). The per-attachment-hour
+  charge is not per-flow (DEC-015). 1 GiB on the wire, 0.5 GiB sent -> $0.01.
+  (100.64/10 is RFC-6598 shared space — treated as external unless registered
+  as a cluster CIDR.)
 provider: aws
 region: us-east-1
 zones:
@@ -29,4 +32,4 @@ expect:
     - from: api
       to: tgw-peer
       type: transit_gateway
-      costUSD: 0.02
+      costUSD: 0.01 # 0.5 GiB sent * $0.02/GiB data processing

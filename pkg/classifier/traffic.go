@@ -14,7 +14,7 @@ type TrafficType int
 const (
 	Unknown            TrafficType = iota
 	SameZone                       // free on all clouds
-	CrossAZ                        // charged on AWS/Azure, free on GCP intra-region
+	CrossAZ                        // charged on AWS and GCP (inter-zone); free on Azure — inter-AZ charges retired (DEC-014)
 	CrossRegion                    // charged everywhere
 	InternetEgress                 // charged per GB, tiered pricing
 	NATGatewayEgress               // charged per GB + per hour
@@ -105,8 +105,17 @@ type Classifier struct {
 	resolver *ZoneResolver
 
 	// Prefix tree for O(prefix-length) CIDR → traffic type lookups.
-	// Replaces linear scans over separate CIDR slices.
+	// Rebuilt from the per-category CIDR sets below on every Set*CIDRs
+	// call (replace-on-refresh, DEC-015): the topology refresher calls
+	// those setters every few minutes, and append semantics grew the tree
+	// unboundedly while keeping deleted peerings classifying forever.
 	prefixTree *PrefixTree
+
+	// Per-category topology CIDR sets — the sources the prefix tree is
+	// rebuilt from.
+	peeringCIDRs  []netip.Prefix
+	tgwCIDRs      []netip.Prefix
+	endpointCIDRs []netip.Prefix
 
 	// clusterPrefixes are CIDRs that must be treated as cluster-internal
 	// regardless of whether they fall in RFC 1918 private space. The K8s
@@ -121,6 +130,13 @@ type Classifier struct {
 	clusterPrefixes []netip.Prefix
 
 	natGatewayIPs map[netip.Addr]bool
+
+	// defaultRouteNAT is true when this node's subnet default-routes
+	// through a NAT gateway (learned from the cloud provider's route
+	// tables, DEC-015). Internet-bound flows from such subnets classify
+	// NATGatewayEgress: the destination stays the internet IP, so the
+	// dst==NAT-ENI check can never fire for them.
+	defaultRouteNAT bool
 }
 
 // New creates a Classifier with the given zone resolver.
@@ -139,15 +155,23 @@ func New(resolver *ZoneResolver) *Classifier {
 //  1. ServiceMeshInternal — flow.IsSidecar (mesh sidecar loopback)
 //  2. IntraNode — flow.IntraNode OR loopback dst (127/8)
 //  3. Cluster-internal CIDRs (operator-supplied or informer-fed)
-//  4. RFC 1918 / link-local fallback
+//  4. RFC 1918 / link-local — NAT IPs, then the peering/TGW/endpoint
+//     prefix sets, then zone-based fallback
 //  5. External — prefix tree lookup (peering / TGW / VPC endpoints)
-//  6. Default: InternetEgress
+//  6. Default: InternetEgress (NATGatewayEgress when the node's subnet
+//     default-routes through a NAT gateway, DEC-015)
 //
 // Cluster-internal classification has priority over RFC 1918 detection
 // because some installations use non-RFC-1918 CIDRs for pod IPs (notably
 // EKS Custom Networking with 100.64.0.0/10). Without this guard, traffic
 // to such pods is incorrectly classified as InternetEgress and the
 // flagship per-traffic-type breakdown lies on those clusters.
+//
+// The RFC 1918 branch consults the peering/TGW/endpoint prefix sets before
+// falling back to zone resolution: real VPC peers are almost always RFC 1918,
+// and skipping the prefix sets collapsed every peered flow to Unknown — which
+// the cost engine prices at $0 (P5: attribute accurately, don't default to
+// the flattering answer).
 func (c *Classifier) Classify(flow FlowInfo) Result {
 	dstAddr := nboToAddr(flow.DstIP)
 	result := Result{}
@@ -173,9 +197,9 @@ func (c *Classifier) Classify(flow FlowInfo) Result {
 		return c.classifyInternal(flow, dstAddr, &result)
 	}
 
-	// Step 4: RFC 1918 / link-local fallback.
+	// Step 4: RFC 1918 / link-local — NAT and topology prefixes first.
 	if isPrivate(dstAddr) {
-		return c.classifyInternal(flow, dstAddr, &result)
+		return c.classifyPrivate(flow, dstAddr, &result)
 	}
 
 	return c.classifyExternal(flow, dstAddr, &result)
@@ -247,16 +271,31 @@ func (c *Classifier) ClusterCIDRs() []netip.Prefix {
 	return out
 }
 
-func (c *Classifier) classifyInternal(flow FlowInfo, dstAddr netip.Addr, result *Result) Result {
-	srcAddr := nboToAddr(flow.SrcIP)
-
+// classifyPrivate handles non-cluster RFC 1918 / link-local destinations:
+// known NAT gateway ENI IPs, then the peering/TGW/endpoint prefix sets, then
+// the zone-based fallback. Per P5, the prefix sets are consulted BEFORE zone
+// resolution — a peered VPC's addresses never resolve to a local zone, so the
+// old order (zones first, prefix tree never) classified real RFC 1918 peers
+// as Unknown and priced them at $0.
+func (c *Classifier) classifyPrivate(flow FlowInfo, dstAddr netip.Addr, result *Result) Result {
 	c.mu.RLock()
 	isNAT := c.natGatewayIPs[dstAddr]
+	tt, matched := c.prefixTree.Lookup(dstAddr)
 	c.mu.RUnlock()
+
 	if isNAT {
 		result.Type = NATGatewayEgress
 		return *result
 	}
+	if matched {
+		result.Type = tt
+		return *result
+	}
+	return c.classifyInternal(flow, dstAddr, result)
+}
+
+func (c *Classifier) classifyInternal(flow FlowInfo, dstAddr netip.Addr, result *Result) Result {
+	srcAddr := nboToAddr(flow.SrcIP)
 
 	// Resolve zones for both endpoints.
 	result.SrcZone = c.resolver.Resolve(srcAddr)
@@ -293,28 +332,63 @@ func (c *Classifier) classifyExternal(flow FlowInfo, dstAddr netip.Addr, result 
 		return *result
 	}
 
+	// Per DEC-015: when this node's subnet default-routes through a NAT
+	// gateway, internet-bound bytes traverse it and incur NAT processing
+	// + egress — the dst stays the internet IP, so only route knowledge
+	// can attribute the NAT charge.
+	if c.defaultRouteNAT {
+		result.Type = NATGatewayEgress
+		return *result
+	}
+
 	result.Type = InternetEgress
 	return *result
 }
 
-// SetVPCPeeringCIDRs updates the known VPC peering CIDR ranges.
+// rebuildPrefixTreeLocked reconstructs the lookup tree from the per-category
+// CIDR sets. Callers must hold c.mu. Replace-on-refresh (DEC-015): the tree
+// always reflects exactly the latest topology snapshot, so deleted peerings
+// stop classifying and periodic refreshes cannot grow it unboundedly.
+func (c *Classifier) rebuildPrefixTreeLocked() {
+	tree := NewPrefixTree()
+	for _, cidr := range c.peeringCIDRs {
+		tree.Add(cidr, VPCPeering)
+	}
+	for _, cidr := range c.tgwCIDRs {
+		tree.Add(cidr, TransitGateway)
+	}
+	for _, cidr := range c.endpointCIDRs {
+		tree.Add(cidr, VPCEndpoint)
+	}
+	tree.Build()
+	c.prefixTree = tree
+}
+
+// clonePrefixes copies a caller-owned prefix slice, dropping invalid entries.
+func clonePrefixes(cidrs []netip.Prefix) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(cidrs))
+	for _, p := range cidrs {
+		if p.IsValid() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// SetVPCPeeringCIDRs replaces the known VPC peering CIDR ranges.
 func (c *Classifier) SetVPCPeeringCIDRs(cidrs []netip.Prefix) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, cidr := range cidrs {
-		c.prefixTree.Add(cidr, VPCPeering)
-	}
-	c.prefixTree.Build()
+	c.peeringCIDRs = clonePrefixes(cidrs)
+	c.rebuildPrefixTreeLocked()
 }
 
-// SetTransitGatewayCIDRs updates the known transit gateway CIDR ranges.
+// SetTransitGatewayCIDRs replaces the known transit gateway CIDR ranges.
 func (c *Classifier) SetTransitGatewayCIDRs(cidrs []netip.Prefix) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, cidr := range cidrs {
-		c.prefixTree.Add(cidr, TransitGateway)
-	}
-	c.prefixTree.Build()
+	c.tgwCIDRs = clonePrefixes(cidrs)
+	c.rebuildPrefixTreeLocked()
 }
 
 // SetNATGatewayIPs updates the set of known NAT gateway IPs.
@@ -328,14 +402,21 @@ func (c *Classifier) SetNATGatewayIPs(ips []netip.Addr) {
 	c.mu.Unlock()
 }
 
-// SetVPCEndpointCIDRs updates the known VPC endpoint prefix lists.
+// SetVPCEndpointCIDRs replaces the known VPC endpoint prefix lists.
 func (c *Classifier) SetVPCEndpointCIDRs(cidrs []netip.Prefix) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, cidr := range cidrs {
-		c.prefixTree.Add(cidr, VPCEndpoint)
-	}
-	c.prefixTree.Build()
+	c.endpointCIDRs = clonePrefixes(cidrs)
+	c.rebuildPrefixTreeLocked()
+}
+
+// SetDefaultRouteNAT records whether this node's subnet default-routes
+// through a NAT gateway (from the cloud provider's route tables, DEC-015).
+// When true, internet-bound flows classify NATGatewayEgress.
+func (c *Classifier) SetDefaultRouteNAT(viaNAT bool) {
+	c.mu.Lock()
+	c.defaultRouteNAT = viaNAT
+	c.mu.Unlock()
 }
 
 // helpers

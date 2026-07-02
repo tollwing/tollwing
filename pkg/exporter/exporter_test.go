@@ -380,3 +380,42 @@ func TestExporter_Shutdown(t *testing.T) {
 		t.Error("expected connection error after shutdown")
 	}
 }
+
+// TestExporter_KernelDropMetrics is the regression test for the lying drop
+// instrumentation: tollwing_ringbuf_drops_total had no writers and read 0
+// forever. The kernel-mirrored totals must surface in both drop metrics.
+func TestExporter_KernelDropMetrics(t *testing.T) {
+	addr := freePort()
+	e := New(Config{ListenAddr: addr}, slog.Default())
+
+	e.SetKernelDropStats(7, 13)
+	// Cumulative kernel counters: a later, larger reading replaces the
+	// earlier one rather than accumulating on top of it.
+	e.SetKernelDropStats(9, 21)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	resp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	buf := make([]byte, 32768)
+	n, _ := resp.Body.Read(buf)
+	body := string(buf[:n])
+
+	for _, want := range []string{
+		"tollwing_ringbuf_drops_total 9\n",
+		"tollwing_map_update_drops_total 21\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q", want)
+		}
+	}
+}

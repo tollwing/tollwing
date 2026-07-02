@@ -8,9 +8,13 @@
 
 **Per-pod Kubernetes network cost, by AWS billing path.**
 
-An eBPF agent attributes every byte of network traffic to the exact pod paying for it, classifies it across **9 AWS billing paths** (same-zone, cross-AZ, cross-region, internet egress, NAT gateway, VPC peering, transit gateway, VPC endpoint, cloud-service public endpoint), and turns it into dollars: live, per-pod, per-namespace. No app changes. ~0.1–0.5% CPU.
+An eBPF agent meters every byte of pod TCP traffic in-kernel (UDP and QUIC are one flag away: `-udp`), attributes it to the pod that sent or received it, and prices it across **9 AWS billing paths** (same-zone, cross-AZ, cross-region, internet egress, NAT gateway, VPC peering, transit gateway, VPC endpoint, cloud-service public endpoint): live, per-pod, per-namespace. Of the metered bytes, the few whose billing path can't be proven are booked as **Unknown — never guessed**; bytes it doesn't meter are absent, never estimated. Every dollar you see is metered bytes × a dated rate: traceable, auditable, and honest about its own blind spots. No app changes. Designed to a 0.1–0.5%-of-one-core overhead budget ([`ARCHITECTURE.md`](ARCHITECTURE.md) §2.4); we'll publish measured numbers only alongside a reproducible benchmark.
 
-> Most tools tell you your data-transfer bill is high. Tollwing tells you **which pod, talking to which pod, over which billing path** is paying it, the slice nobody else has at pod resolution.
+> Most tools tell you your data-transfer bill is high. Tollwing tells you **which pod, talking to which service, over which of 9 AWS billing paths, in dollars**. As of July 2026 nothing else we know of ships all three at once: Datadog spreads bill-line spend to workloads proportionally (no per-pod, 4 CUR transfer types), Kubecost meters per pod but into 3 heuristic buckets and loses ClusterIP intent ([kubecost#2464](https://github.com/kubecost/kubecost/issues/2464), closed unfixed), and AWS's Container Network Observability shows bytes, not dollars. Know a tool that does all three? [Open an issue](https://github.com/tollwing/tollwing/issues) — we'll correct this line.
+
+![make demo: the cross-AZ differentiator scenario and all 9 billing paths, priced through the production cost engine](docs/images/demo.gif)
+
+*`make demo`, real output: the cross-AZ intent that post-DNAT tools mis-attribute, priced correctly to the dialed service — then every billing path through the same engine. ([recording source](docs/images/demo.cast))*
 
 ## See it in 60 seconds: no cloud account, no cluster
 
@@ -22,7 +26,7 @@ Prices a real cross-AZ + NAT-gateway scenario through the pure-Go cost oracle (`
 
 ## What you'll see: live, per-pod, in your Grafana
 
-The agent classifies every byte and exposes it as `tollwing_*` Prometheus metrics; the included 23-panel dashboard renders the breakdown. A namespace's network cost by billing path looks like:
+The agent classifies every metered byte and exposes it as `tollwing_*` Prometheus metrics; the included 23-panel dashboard renders the breakdown. A namespace's network cost by billing path looks like:
 
 ```
 cross_az            $5.67   (46%)
@@ -36,10 +40,15 @@ No control-plane server is needed for this single-cluster view: the agent expose
 
 | | per-pod | by AWS billing path | eBPF | dollars |
 |---|:---:|:---:|:---:|:---:|
-| **Tollwing** | ✓ | ✓ (9-way) | ✓ | ✓ |
-| Datadog CCM | cluster-level | 4 buckets | ✓ | ✓ |
-| Kubecost / OpenCost | partial | 3 buckets (heuristic) | ✗ | ✓ |
-| AWS Network Flow Monitor | ✓ | partial | ✓ | ✗ |
+| **Tollwing** | ✓ | ✓ (9-way, per flow) | ✓ | ✓ |
+| Datadog CCM + CNM | workload-level¹ | 4 CUR transfer types | ✓ | ✓ |
+| Kubecost / OpenCost | ✓ (conntrack)² | 3 buckets (heuristic) | ✗ | ✓ |
+| AWS Container Network Observability (EKS) | ✓ | partial | ✓ | ✗ (bytes, not dollars) |
+
+Comparison as of 2026-07-02, from each vendor's published docs; if we got a row wrong, [open an issue](https://github.com/tollwing/tollwing/issues) and we'll fix it.
+
+¹ Datadog allocates CUR data-transfer spend down to the *workload* level by spreading node bill lines proportionally by traffic volume (requires Cloud Network Monitoring on every host; its docs state individual pods are not tracked). Tollwing meters each flow bottom-up, pre-DNAT, and prices it per path — different question, different answer.
+² Kubecost's conntrack daemonset is per-pod but classifies post-DNAT into 3 buckets; ClusterIP/RFC1918 traffic defaults to in-zone ([kubecost#2464](https://github.com/kubecost/kubecost/issues/2464)).
 
 ## Install
 
@@ -53,11 +62,11 @@ The agent auto-detects provider + region via IMDS, and exposes `tollwing_*` Prom
 
 The control-plane server (long-term history, multi-cluster aggregation, REST API, CLI, alerts, and the premium analytics) is **Tollwing Enterprise**. See [Open-core](#open-core).
 
-## How it works: the part nobody else does
+## How it works: the part post-DNAT tools structurally miss
 
-Tollwing captures each connection's destination **before kube-proxy DNAT** (via `cgroup/connect4`), recovering the original ClusterIP *intent* instead of only the rewritten backend IP. The backend-node agent then observes the real pod endpoint and prices cross-AZ movement exactly once; the dialer-side ClusterIP leg stays `Unknown` rather than guessing a zone (DEC-003 / DEC-010). In-kernel PERCPU aggregation keeps overhead at ~0.1–0.5% CPU. Full detail in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+Tollwing captures each connection's destination **before kube-proxy DNAT** (via `cgroup/connect4`), recovering the original ClusterIP *intent* instead of only the rewritten backend IP. The backend-node agent then observes the real pod endpoint and prices cross-AZ movement exactly once; the dialer-side ClusterIP leg stays `Unknown` rather than guessing a zone (DEC-003 / DEC-010). "Classified deterministically" means we refuse to guess, not that we pretend to know everything: anything Tollwing can't prove lands in an explicit `Unknown` bucket. In-kernel PERCPU aggregation keeps the per-packet work in the kernel; the overhead budget is 0.1–0.5% of one core ([`ARCHITECTURE.md`](ARCHITECTURE.md) §2.4). Full detail in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-Outputs: Prometheus/OTel metrics, Grafana dashboards, and an **OpenCost-compatible** plugin.
+Outputs: `tollwing_*` Prometheus metrics, the 23-panel Grafana dashboard, and a standalone **FOCUS-aligned JSON cost-export** sidecar (`opencost-plugin/`) for external cost tooling.
 
 ## Open-core
 
@@ -67,14 +76,14 @@ The agent that attributes the cost is free and Apache-2.0, and runs standalone: 
 |---|---|
 | 9-way per-pod classifier + eBPF agent | Control-plane server: long-term history, REST API, CLI, Cost Savings Report |
 | Pre-DNAT cross-AZ + service-graph attribution | Multi-cluster aggregation · CUR reconciliation → your *actual discounted* rates |
-| Prometheus + 23-panel Grafana + OpenCost plugin | Alerts · anomaly detection · recommendations · what-if · auto-remediation |
+| Prometheus + 23-panel Grafana + FOCUS-aligned JSON cost export | Alerts · anomaly detection · recommendations · what-if · auto-remediation |
 | Single cluster, AWS, your Prometheus retention | GCP/Azure · SSO/RBAC (early access) · multi-tenant |
 
-The free agent runs unlicensed, with no extra infrastructure and no phone-home.
+The free agent runs unlicensed, with no extra infrastructure and no phone-home. The precise boundary, the no-rug-pull commitment, and where new features land: [`OPEN-CORE.md`](OPEN-CORE.md).
 
 ## Engineering governance
 
-Tollwing keeps a small, mechanically-enforced set of principles and an append-only decision log: [`CONSTITUTION.md`](CONSTITUTION.md) (twelve binding principles, P1–P12), [`decisions/`](decisions/) (ADRs), and [`docs/governance/`](docs/governance/). CI blocks constitutional regressions via `go run ./tools/governance scan`. New contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Tollwing keeps a small, mechanically-enforced set of principles and an append-only decision log: [`CONSTITUTION.md`](CONSTITUTION.md) (twelve binding principles, P1–P12), [`decisions/`](decisions/) (ADRs), and [`docs/governance/`](docs/governance/). CI blocks constitutional regressions via `go run ./tools/governance scan`. Project governance — maintainer model, decision rights, how the public repo is generated: [`GOVERNANCE.md`](GOVERNANCE.md). New contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Development
 
@@ -85,6 +94,7 @@ go build ./cmd/tollwing-agent                         # agent: Linux + eBPF
 go test ./pkg/...
 make demo                                             # pure-Go cost scenarios
 ```
+
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design, and `tollwing-agent -h` / `tollwing-terraform -h` for the complete flag reference.
 

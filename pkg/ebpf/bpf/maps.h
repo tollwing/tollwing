@@ -11,7 +11,10 @@ struct agent_config {
 	__u8  enabled;
 	__u8  track_udp;          // also hook UDP connects (for DNS cost attribution)
 	__u8  sample_rate;        // 1 = every conn, N = 1/N sampling
-	__u8  reserved[5];
+	__u8  udp_socket_tx;      // 1 = fentry/udp_sendmsg is attached AND track_udp
+	                          // is on: the socket path owns UDP TX bytes and the
+	                          // TC QUIC hook must record nothing (see quic.bpf.c)
+	__u8  reserved[4];
 	__u64 aggregation_ns;     // flow flush interval (default: 5s)
 };
 
@@ -125,73 +128,41 @@ struct {
 	__type(value, struct flow_metrics);
 } flow_aggregates SEC(".maps");
 
+// Per DEC-016, the nat_mappings conntrack cache, the cgroup_cost_storage
+// CGRP_STORAGE accumulator, and the sk_cost_storage iterator source were
+// removed: dormant kernel machinery with per-packet cost and no userspace
+// consumer. See decisions/DEC-016 for the rationale and resurrection notes.
+
 // ============================================================================
-// NAT mapping cache — populated by fentry/nf_conntrack_confirm (optional).
-// Used to enhance DNAT resolution when cgroup/connect4 + sock_ops
-// two-phase correlation is insufficient (e.g., hairpin NAT, external LB).
+// Drop accounting — cumulative counters for data the kernel side could NOT
+// record (full ring buffer, full aggregation map). Read by the poller and
+// surfaced as exporter metrics so operators can see when cost figures are
+// undercounting (P4 — a dollar figure must be traceable, including its gaps).
 // ============================================================================
 
-struct nat_mapping {
-	__u32 pre_dnat_ip;
-	__u16 pre_dnat_port;
-	__u32 post_dnat_ip;
-	__u16 post_dnat_port;
-	__u64 timestamp_ns;
+// Slots in the drop_counters PERCPU_ARRAY.
+// Must match the constants in pkg/ebpf/drops.go.
+enum drop_slot {
+	DROP_SLOT_EVENTS_RINGBUF  = 0, // events ringbuf reserve failures
+	DROP_SLOT_FLOW_AGGREGATES = 1, // flow_aggregates map-full update failures
+	DROP_SLOT_DNS_RINGBUF     = 2, // dns_events ringbuf reserve failures
+	DROP_SLOT_QUIC_FLOWS      = 3, // quic_flows map-full update failures
+	DROP_SLOT_MAX             = 4,
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 131072); // 128K NAT mappings
-	__type(key, __u64);          // hash(src_ip, src_port, dst_ip, dst_port)
-	__type(value, struct nat_mapping);
-} nat_mappings SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, DROP_SLOT_MAX);
+	__type(key, __u32);
+	__type(value, __u64);
+} drop_counters SEC(".maps");
 
-// ============================================================================
-// Per-cgroup cost accumulation (kernel 6.3+, BPF_MAP_TYPE_CGRP_STORAGE).
-//
-// Accumulates bytes directly per cgroup, providing native per-container/pod
-// byte accounting without the flow → PID → cgroup → pod userspace lookup.
-// Optional: coexists with flow_aggregates path.
-// ============================================================================
-
-struct cgroup_cost {
-	__u64 tx_bytes;
-	__u64 rx_bytes;
-	__u64 retransmit_bytes;
-	__u64 conn_count;
-};
-
-#ifdef BPF_MAP_TYPE_CGRP_STORAGE
-struct {
-	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, int);  // cgroup fd (unused in BPF side, kernel manages)
-	__type(value, struct cgroup_cost);
-} cgroup_cost_storage SEC(".maps");
-#endif
-
-// ============================================================================
-// Per-socket metadata for BPF iterators (kernel 6.4+).
-//
-// Stores per-socket cost metadata, populated from sock_ops on establish.
-// Read via SEC("iter/bpf_sk_storage_map") for consistent state snapshots.
-// ============================================================================
-
-struct sk_cost_meta {
-	struct flow_key fk;
-	__u64 tx_bytes;
-	__u64 rx_bytes;
-	__u64 retransmit_bytes;
-	__u64 cgroupid;
-	__u64 start_ns;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, int);  // socket fd (unused in BPF side, kernel manages)
-	__type(value, struct sk_cost_meta);
-} sk_cost_storage SEC(".maps");
+static __always_inline void count_drop(__u32 slot)
+{
+	__u64 *v = bpf_map_lookup_elem(&drop_counters, &slot);
+	if (v)
+		__sync_fetch_and_add(v, 1);
+}
 
 // ============================================================================
 // QUIC flow tracking (kernel 6.6+ for bpf_dynptr, fallback to manual parsing).
@@ -287,7 +258,7 @@ struct establish_event {
 	char  comm[16];
 };
 
-// Emitted by sock_ops on TCP state change to CLOSE / CLOSE_WAIT / FIN_WAIT.
+// Emitted by sock_ops on TCP state change to TCP_CLOSE (fully closed).
 // Final byte counters and connection duration.
 struct close_event {
 	__u8  type;               // EVENT_CLOSE

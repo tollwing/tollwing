@@ -13,6 +13,12 @@ The audience explicitly includes **AI agents**: an ADR is how a future agent inh
 <!-- INDEX:BEGIN -->
 | ID | Title | Status | Date | Principles |
 |---|---|---|---|---|
+| [DEC-019](DEC-019-cluster-identity-fail-fast-nats-subject.md) | Derive cluster identity from the kube-system UID and fail fast on invalid NATS subjects | ACCEPTED | 2026-07-02 | P1, P3, P4, P11 |
+| [DEC-017](DEC-017-remove-dead-proto-and-honest-cost-export.md) | Remove the dead proto/ contract and re-scope opencost-plugin as an honest cost-export sidecar | ACCEPTED | 2026-07-02 | P1, P2, P4, P6, P9, P11 |
+| [DEC-016](DEC-016-remove-dormant-cgroup-storage-iterator-and-conntrack-machinery.md) | Remove dormant cgroup-storage, sk-storage-iterator, and conntrack NAT machinery from the data plane | ACCEPTED | 2026-07-02 | P1, P2, P3, P5 |
+| [DEC-015](DEC-015-route-based-nat-detection-and-hourly-charges.md) | Detect NAT egress from route tables; price the DTO leg; keep hourly charges out of per-flow cost | ACCEPTED | 2026-07-02 | P1, P2, P4, P5, P11, P12 |
+| [DEC-014](DEC-014-metered-directions-and-marginal-default-pricing.md) | Meter billable directions per traffic type; price distributed engines at the marginal list rate | ACCEPTED | 2026-07-02 | P1, P2, P4, P5, P6, P11 |
+| [DEC-013](DEC-013-open-core-repo-split-allow-list-boundary.md) | Publish the open core as a generated public repo; define the boundary by allow-list | ACCEPTED | 2026-07-02 | P1, P9, P11, P12 |
 | [DEC-011](DEC-011-float-cost-accumulation-round-at-emit.md) | Accumulate network cost in full-precision float dollars; round once at emit (fix sub-micro-dollar flow truncation) | ACCEPTED | 2026-05-30 | P1, P2, P4, P6, P11 |
 | [DEC-010](DEC-010-clusterip-dialer-side-cross-az-attribution.md) | Leave the ClusterIP dialer-side leg Unknown; cross-AZ dedup/attribution is a control-plane job | ACCEPTED | 2026-05-30 | P1, P2, P4, P5 |
 | [DEC-009](DEC-009-canonical-bpf-ip-byte-order.md) | Define one canonical byte order for BPF-delivered IP fields (fix cross-AZ misclassification) | ACCEPTED | 2026-05-30 | P2, P3, P4, P5, P6, P11 |

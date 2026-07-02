@@ -1,0 +1,34 @@
+name: vpc-peering-rfc1918
+description: >
+  Traffic to a peered VPC whose CIDR is RFC 1918 — the overwhelmingly common
+  real-world case (VPCs are private address space). The classifier must
+  consult the peering prefix set for private destinations, not collapse them
+  to Unknown/$0 (the bug this scenario pins). AWS intra-region peering bills
+  $0.01/GiB in each direction, like cross-AZ (DEC-014). 1 GiB (0.5 up +
+  0.5 down) -> $0.01.
+provider: aws
+region: us-east-1
+zones:
+  us-east-1a:
+    region: us-east-1
+services:
+  api:
+    zone: us-east-1a
+    namespace: shop
+external:
+  peer-db:
+    ip: 10.50.1.10
+vpcPeeringCIDRs:
+  - 10.50.0.0/16
+traffic:
+  - from: api
+    to: peer-db
+    requests: 1048576
+    requestBytes: 512
+    responseBytes: 512
+expect:
+  edges:
+    - from: api
+      to: peer-db
+      type: vpc_peering
+      costUSD: 0.01 # 1 GiB total * $0.01/GiB (both directions metered)

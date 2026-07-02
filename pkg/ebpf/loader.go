@@ -26,8 +26,7 @@ import (
 // Zero means use the compiled-in default (see setDefaults).
 type MapSizeConfig struct {
 	Connections    uint32 // connections LRU_HASH (default: 65536)
-	FlowAggregates uint32 // flow_aggregates PERCPU_HASH (default: 16384)
-	NatMappings    uint32 // nat_mappings LRU_HASH (default: 16384)
+	FlowAggregates uint32 // flow_aggregates PERCPU_HASH (default: 131072)
 	QuicFlows      uint32 // quic_flows PERCPU_HASH (default: 8192)
 	EventsRingBuf  uint32 // events ring buffer in bytes (default: 1MB)
 	DNSRingBuf     uint32 // dns_events ring buffer in bytes (default: 256KB)
@@ -38,10 +37,15 @@ func (c *MapSizeConfig) setDefaults() {
 		c.Connections = 65536 // 64K — sufficient for most nodes
 	}
 	if c.FlowAggregates == 0 {
-		c.FlowAggregates = 16384 // 16K unique flows per CPU
-	}
-	if c.NatMappings == 0 {
-		c.NatMappings = 16384
+		// Matches the compiled-in size in bpf/maps.h and ARCHITECTURE.md's
+		// 128K sizing. The flow key includes the ephemeral src_port, so
+		// every connection is its own entry — the previous 16K default
+		// silently dropped flows on busy nodes (each dropped update now
+		// increments tollwing_map_update_drops_total). Cost: the value is
+		// 48 B per CPU per entry, preallocated — ~48 MiB × NCPU/8 at 128K
+		// entries — so memory-constrained deployments should tune this
+		// down explicitly rather than being lied to by a small default.
+		c.FlowAggregates = 131072
 	}
 	if c.QuicFlows == 0 {
 		c.QuicFlows = 8192
@@ -110,6 +114,11 @@ type Loader struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	dnsTracker *dns.Tracker
+
+	// udpSendmsgAttached records whether fentry/udp_sendmsg actually
+	// attached this run. Feeds udpSocketTX, which decides who owns UDP TX
+	// bytes (socket path vs TC QUIC hook) — see bpf/quic.bpf.c.
+	udpSendmsgAttached bool
 }
 
 // NewLoader creates a Loader with the given config. Call Start to load and
@@ -173,6 +182,15 @@ func (l *Loader) Start(ctx context.Context) error {
 		return err
 	}
 
+	// ---- Attach cgroup/sock_release for connection-table cleanup ----
+	// UDP entries in `connections` have no sock_ops close path; without
+	// this hook they live until LRU eviction, and enough UDP churn evicts
+	// live TCP entries (P2 — bounded state must not cannibalize accuracy).
+	// Kernel 5.9+; non-fatal because TCP still cleans up via STATE_CB (P3).
+	if err := l.attachCgroupProg(coll, "tollwing_sock_release", ebpf.AttachCgroupInetSockRelease); err != nil {
+		l.log.Warn("cgroup/sock_release unavailable, UDP connection-table cleanup disabled", "err", err)
+	}
+
 	// ---- Attach byte counting hooks ----
 	// Prefer fentry (reliable bpf_get_socket_cookie with struct sock *).
 	// Fall back to kprobe if fentry is unavailable.
@@ -181,22 +199,9 @@ func (l *Loader) Start(ctx context.Context) error {
 		return err
 	}
 
-	// ---- Attach conntrack NAT resolution (tiered degradation) ----
-	// Tier 1: netfilter prog with CT kfuncs (kernel 6.4+)
-	// Tier 2: fentry/nf_conntrack_confirm (kernel 5.11+)
-	// Tier 3: two-phase only (cgroup/connect4 + sock_ops)
-	if HaveNetfilterProg() {
-		if err := l.attachNetfilter(coll, "tollwing_conntrack_kfunc"); err != nil {
-			l.log.Warn("netfilter/conntrack_kfunc unavailable, trying fentry", "err", err)
-			l.attachFentryConntrack(coll)
-		} else {
-			l.log.Info("netfilter/conntrack kfunc attached (tier 1 NAT resolution)")
-		}
-	} else if HaveFentry() {
-		l.attachFentryConntrack(coll)
-	} else {
-		l.log.Info("conntrack hooks unavailable, using two-phase correlation only")
-	}
+	// Per DEC-016, the conntrack NAT-resolution attach tiers were removed:
+	// per-packet hooks feeding a map nothing read. Pre-DNAT intent comes
+	// from the two-phase capture (DEC-003).
 
 	// ---- Attach optional fentry retransmit hooks (kernel 5.11+) ----
 	if HaveFentry() {
@@ -231,8 +236,9 @@ func (l *Loader) Start(ctx context.Context) error {
 	// ---- Attach optional UDP byte counting (fentry) ----
 	if HaveFentry() {
 		if err := l.attachFentry(coll, "tollwing_udp_sendmsg", "udp_sendmsg"); err != nil {
-			l.log.Warn("fentry/udp_sendmsg unavailable, UDP TX byte counting disabled", "err", err)
+			l.log.Warn("fentry/udp_sendmsg unavailable, socket-level UDP TX byte counting disabled (TC QUIC hook remains the UDP TX source)", "err", err)
 		} else {
+			l.udpSendmsgAttached = true
 			l.log.Info("fentry/udp_sendmsg attached (UDP TX byte counting)")
 		}
 		// fexit uses the same AttachTracing API — the SEC("fexit/...") type is in the BPF object.
@@ -377,34 +383,26 @@ func (l *Loader) Maps() map[string]*ebpf.Map {
 // starting if they fail to load. They are pruned before collection creation
 // when feature probes indicate the kernel lacks support.
 var optionalPrograms = map[string]struct{}{
-	"tollwing_connect6":                 {},
-	"tollwing_conntrack_confirm":        {},
-	"tollwing_conntrack_confirm_kprobe": {},
-	"tollwing_conntrack_kfunc":          {},
-	"tollwing_tcp_retransmit":           {},
-	"tollwing_tcp_loss_probe":           {},
-	"tollwing_dns_recvmsg":              {},
-	"tollwing_udp_recvmsg_exit":         {},
-	"tollwing_udp_sendmsg":              {},
-	"tollwing_quic_egress":              {},
-	"tollwing_tcp_sendmsg_fentry":       {},
-	"tollwing_tcp_cleanup_rbuf_fentry":  {},
-	"tollwing_tcp_sendmsg":              {},
-	"tollwing_tcp_cleanup_rbuf":         {},
+	"tollwing_connect6":                {},
+	"tollwing_sock_release":            {},
+	"tollwing_tcp_retransmit":          {},
+	"tollwing_tcp_loss_probe":          {},
+	"tollwing_dns_recvmsg":             {},
+	"tollwing_udp_recvmsg_exit":        {},
+	"tollwing_udp_sendmsg":             {},
+	"tollwing_quic_egress":             {},
+	"tollwing_tcp_sendmsg_fentry":      {},
+	"tollwing_tcp_cleanup_rbuf_fentry": {},
+	"tollwing_tcp_sendmsg":             {},
+	"tollwing_tcp_cleanup_rbuf":        {},
 }
 
 // pruneOptionalPrograms removes optional BPF programs from the spec when
 // feature probes indicate they cannot be loaded on this kernel.
 func (l *Loader) pruneOptionalPrograms(spec *ebpf.CollectionSpec) {
-	// Conntrack kfunc requires netfilter prog type (kernel 6.4+)
-	if !HaveNetfilterProg() {
-		l.removeProgram(spec, "tollwing_conntrack_kfunc")
-	}
-
 	// fentry-based programs require tracing support
 	if !HaveFentry() {
 		for _, name := range []string{
-			"tollwing_conntrack_confirm",
 			"tollwing_tcp_retransmit",
 			"tollwing_tcp_loss_probe",
 			"tollwing_dns_recvmsg",
@@ -415,16 +413,11 @@ func (l *Loader) pruneOptionalPrograms(spec *ebpf.CollectionSpec) {
 		} {
 			l.removeProgram(spec, name)
 		}
-		// Keep kprobe conntrack variant when fentry unavailable.
 	} else {
 		// When fentry IS available, prune kprobe byte counting since
 		// bpf_get_socket_cookie may not work in kprobe context.
 		l.removeProgram(spec, "tollwing_tcp_sendmsg")
 		l.removeProgram(spec, "tollwing_tcp_cleanup_rbuf")
-		// Keep both conntrack variants — loader will try fentry first,
-		// fall back to kprobe. The fallback handles the case where fentry
-		// is generally supported but nf_conntrack_confirm specifically
-		// isn't traceable (module-local symbol).
 	}
 
 	// QUIC TC requires TCX (kernel 6.6+)
@@ -439,7 +432,6 @@ func (l *Loader) applyMapSizeOverrides(spec *ebpf.CollectionSpec) {
 	overrides := map[string]uint32{
 		"connections":     l.cfg.MapSizes.Connections,
 		"flow_aggregates": l.cfg.MapSizes.FlowAggregates,
-		"nat_mappings":    l.cfg.MapSizes.NatMappings,
 		"quic_flows":      l.cfg.MapSizes.QuicFlows,
 		"events":          l.cfg.MapSizes.EventsRingBuf,
 		"dns_events":      l.cfg.MapSizes.DNSRingBuf,
@@ -585,48 +577,6 @@ func (l *Loader) attachKprobe(coll *ebpf.Collection, progName, symbol string) er
 	return nil
 }
 
-// attachFentryConntrack tries to attach conntrack hooks.
-// Tries fentry first, then kprobe fallback for module-local symbols.
-func (l *Loader) attachFentryConntrack(coll *ebpf.Collection) {
-	// Try fentry/nf_conntrack_confirm first.
-	if err := l.attachFentry(coll, "tollwing_conntrack_confirm", "nf_conntrack_confirm"); err == nil {
-		l.log.Info("fentry/nf_conntrack_confirm attached (tier 2 NAT resolution)")
-		return
-	} else {
-		l.log.Debug("fentry/nf_conntrack_confirm unavailable, trying kprobe fallback", "err", err)
-	}
-
-	// Fallback: kprobe on __nf_conntrack_confirm (module-local symbol).
-	if err := l.attachKprobe(coll, "tollwing_conntrack_confirm_kprobe", "__nf_conntrack_confirm"); err == nil {
-		l.log.Info("kprobe/__nf_conntrack_confirm attached (tier 2 NAT resolution)")
-		return
-	} else {
-		l.log.Warn("conntrack hooks unavailable, using two-phase fallback only", "err", err)
-	}
-}
-
-// attachNetfilter attaches a netfilter BPF program (kernel 6.4+).
-func (l *Loader) attachNetfilter(coll *ebpf.Collection, progName string) error {
-	prog := coll.Programs[progName]
-	if prog == nil {
-		return fmt.Errorf("BPF program %q not found in collection", progName)
-	}
-
-	l.log.Info("attaching netfilter program", "name", progName)
-
-	lnk, err := link.AttachNetfilter(link.NetfilterOptions{
-		Program:        prog,
-		ProtocolFamily: 2, // AF_INET
-		HookNumber:     3, // NF_INET_LOCAL_OUT
-		Priority:       1,
-	})
-	if err != nil {
-		return fmt.Errorf("attach netfilter %s: %w", progName, err)
-	}
-	l.links = append(l.links, lnk)
-	return nil
-}
-
 // attachTCX attaches a TC program using TCX (kernel 6.6+) for deterministic ordering.
 // Falls back to legacy tc filter if TCX is unavailable.
 func (l *Loader) attachTCX(coll *ebpf.Collection, progName string, ifIndex int) error {
@@ -701,7 +651,25 @@ func (l *Loader) resolveInterface() (int, error) {
 	return iface.Index, nil
 }
 
+// udpSocketTX computes the agent_config.udp_socket_tx bit: 1 when the
+// socket-level path is the authoritative (and sole) source of UDP TX bytes,
+// which requires BOTH -udp (so cgroup/connect4 creates UDP `connections`
+// entries) AND a successfully attached fentry/udp_sendmsg (so those entries
+// actually accumulate bytes). When it returns 1, the TC QUIC hook records
+// nothing; when 0, quic_flows is the sole UDP TX source. Keying the switch
+// off the actual attach outcome — not just the flag — is what keeps the two
+// sources disjoint on kernels without fentry (P5: each byte counted exactly
+// once; see bpf/quic.bpf.c for the full rule).
+func udpSocketTX(trackUDP, udpSendmsgAttached bool) uint8 {
+	if trackUDP && udpSendmsgAttached {
+		return 1
+	}
+	return 0
+}
+
 // pushConfig writes the agent configuration to the BPF agent_config map.
+// Must run after program attachment: udp_socket_tx depends on whether
+// fentry/udp_sendmsg actually attached.
 func (l *Loader) pushConfig() error {
 	cfgMap := l.collection.Maps["agent_config"]
 	if cfgMap == nil {
@@ -720,7 +688,14 @@ func (l *Loader) pushConfig() error {
 		Enabled:       enabled,
 		TrackUDP:      trackUDP,
 		SampleRate:    l.cfg.SampleRate,
+		UDPSocketTX:   udpSocketTX(l.cfg.TrackUDP, l.udpSendmsgAttached),
 		AggregationNs: l.cfg.AggregationNs,
+	}
+
+	if cfg.UDPSocketTX == 1 {
+		l.log.Info("UDP TX source: socket path (fentry/udp_sendmsg); TC QUIC hook idle — unconnected-UDP egress uncounted (documented limitation)")
+	} else {
+		l.log.Info("UDP TX source: TC QUIC hook (quic_flows)")
 	}
 
 	key := uint32(0)

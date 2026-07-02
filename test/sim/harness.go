@@ -54,6 +54,7 @@ func measure(s *scenario.Scenario) []edgeMeasurement {
 	cls.SetVPCPeeringCIDRs(s.PeeringPrefixes())
 	cls.SetTransitGatewayCIDRs(s.TGWPrefixes())
 	cls.SetVPCEndpointCIDRs(s.EndpointPrefixes())
+	cls.SetDefaultRouteNAT(s.DefaultRouteNAT)
 	if cps := s.ClusterPrefixes(); len(cps) > 0 {
 		cls.SetClusterCIDRs(cps)
 	}
@@ -61,7 +62,10 @@ func measure(s *scenario.Scenario) []edgeMeasurement {
 	store := cost.NewRateCardStore()
 	card := rateCard(s.Provider, s.Region)
 	store.Set(card)
-	engine := cost.NewEngine(store)
+	// Default = marginal pricing, exactly as the distributed agents run;
+	// scenarios opt into the Enterprise single-meter mode explicitly
+	// (DEC-014).
+	engine := cost.NewEngineWithConfig(store, cost.EngineConfig{Mode: pricingMode(s)})
 	engine.ResetBillingPeriod() // deterministic tiered pricing per scenario run
 
 	out := make([]edgeMeasurement, 0, len(s.Traffic))
@@ -138,9 +142,11 @@ func Flows(s *scenario.Scenario, ts time.Time) []cost.CostResult {
 	return out
 }
 
-// rateCard returns the product's default dated rate card for the provider.
-// Shared by Measure (product) and Oracle (independent) so both price from the
-// same source of truth (P6) while computing the arithmetic independently (P4).
+// rateCard returns the product's default dated rate card for the provider —
+// the MEASURED side of the differential only. The Oracle deliberately does
+// NOT price from these cards: its rates are transcribed independently from
+// the provider price sheets (oracle.go), so a wrong constant in pkg/cost
+// fails the cross-check instead of being mirrored.
 func rateCard(provider, region string) *cost.RateCard {
 	switch provider {
 	case "gcp":
@@ -150,6 +156,15 @@ func rateCard(provider, region string) *cost.RateCard {
 	default: // "" or "aws"
 		return cost.DefaultAWSRateCard(region)
 	}
+}
+
+// pricingMode maps a scenario's pricingMode knob to the engine config
+// (DEC-014). Validate() already rejected unknown values.
+func pricingMode(s *scenario.Scenario) cost.PricingMode {
+	if s.PricingMode == "single_meter" {
+		return cost.PricingModeSingleMeter
+	}
+	return cost.PricingModeMarginal
 }
 
 // addrToNBO builds the uint32 the classifier's FlowInfo expects, the way the

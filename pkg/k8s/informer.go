@@ -60,6 +60,14 @@ type ServiceRef struct {
 	Name      string
 }
 
+// sliceEndpointEntry records one podIP→service mapping contributed by an
+// EndpointSlice, so slice updates and deletions can remove exactly what the
+// slice added.
+type sliceEndpointEntry struct {
+	addr string
+	ep   ServiceEndpoint
+}
+
 // Informer watches Kubernetes resources and maintains lookup caches.
 type Informer struct {
 	log     *slog.Logger
@@ -74,6 +82,14 @@ type Informer struct {
 	clusterIPToSvc    map[string]ServiceRef        // ClusterIP → service (pre-DNAT intent)
 	nodeZones         map[string]string            // nodeName → zone
 	nodeInstanceTypes map[string]string            // nodeName → instance type
+
+	// endpointsBySlice tracks, per EndpointSlice ("namespace/name"), the
+	// exact entries that slice contributed to podIPToServices. Services with
+	// more than 100 endpoints span multiple slices, so the bookkeeping must
+	// be per-slice: an update to one slice removes and re-adds only its own
+	// entries (not its siblings'), and a slice deletion removes exactly its
+	// contribution. Bounded by the number of live endpoints (P2).
+	endpointsBySlice map[string][]sliceEndpointEntry
 
 	// podCIDRs is the aggregated set of Pod CIDRs across all observed
 	// nodes (Node.spec.podCIDR + Node.spec.podCIDRs for dual-stack).
@@ -151,6 +167,7 @@ func newInformerWithClient(client kubernetes.Interface, cfg Config, log *slog.Lo
 		nodeZones:         make(map[string]string),
 		nodeInstanceTypes: make(map[string]string),
 		podCIDRs:          make(map[string]struct{}),
+		endpointsBySlice:  make(map[string][]sliceEndpointEntry),
 	}
 }
 
@@ -184,11 +201,15 @@ func (inf *Informer) Start(ctx context.Context) {
 		UpdateFunc: func(_, obj interface{}) { inf.onNode(obj.(*corev1.Node)) },
 	})
 
-	// Watch EndpointSlices for pod IP → service mapping.
+	// Watch EndpointSlices for pod IP → service mapping. The DeleteFunc is
+	// required: without it, entries for deleted slices (and thus deleted
+	// services) leaked in podIPToServices forever — unbounded state (P2) and
+	// stale dst_service attribution.
 	epsInformer := inf.factory.Discovery().V1().EndpointSlices().Informer()
 	epsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { inf.onEndpointSlice(obj.(*discoveryv1.EndpointSlice)) },
 		UpdateFunc: func(_, obj interface{}) { inf.onEndpointSlice(obj.(*discoveryv1.EndpointSlice)) },
+		DeleteFunc: func(obj interface{}) { inf.onEndpointSliceDelete(obj) },
 	})
 
 	// Watch Services for ClusterIP → service mapping. This recovers the
@@ -433,46 +454,113 @@ func (inf *Informer) onNode(node *corev1.Node) {
 }
 
 func (inf *Informer) onEndpointSlice(eps *discoveryv1.EndpointSlice) {
+	key := eps.Namespace + "/" + eps.Name
 	svcName := eps.Labels[discoveryv1.LabelServiceName]
-	if svcName == "" {
-		return
-	}
 
 	inf.mu.Lock()
 	defer inf.mu.Unlock()
 
-	// Clear existing entries for this service to avoid stale accumulation.
-	// Then re-add current endpoints. This prevents the leak where deleted
-	// endpoints were never cleaned up from podIPToServices.
-	for addr, seps := range inf.podIPToServices {
-		filtered := seps[:0]
-		for _, se := range seps {
-			if se.ServiceName != svcName || se.ServiceNamespace != eps.Namespace {
-				filtered = append(filtered, se)
-			}
-		}
-		if len(filtered) == 0 {
-			delete(inf.podIPToServices, addr)
-		} else {
-			inf.podIPToServices[addr] = filtered
-		}
+	// Remove exactly what THIS slice previously contributed, then re-add its
+	// current endpoints. The old bookkeeping purged every entry of the owning
+	// SERVICE and re-added only this slice's endpoints — for multi-slice
+	// services (>100 endpoints) any single-slice update silently dropped
+	// dst_service attribution for every sibling slice's endpoints.
+	inf.removeSliceLocked(key)
+
+	if svcName == "" {
+		// Unmanaged slice (no service label): nothing to index, but the
+		// removal above still purges entries from when it was labeled.
+		return
 	}
 
-	// Re-add current endpoints.
+	var added []sliceEndpointEntry
 	for _, ep := range eps.Endpoints {
 		for _, addr := range ep.Addresses {
 			for _, port := range eps.Ports {
 				if port.Port == nil {
 					continue
 				}
-				inf.podIPToServices[addr] = append(inf.podIPToServices[addr], ServiceEndpoint{
+				se := ServiceEndpoint{
 					ServiceName:      svcName,
 					ServiceNamespace: eps.Namespace,
 					Port:             *port.Port,
-				})
+				}
+				// Copy-on-write, same replace-don't-mutate invariant as the
+				// *PodMeta maps (see onNode): LookupService hands the map's
+				// slice to lock-free readers (pkg/agent reads svcs[0] after
+				// the RLock is released), so a published backing array must
+				// never be written again. A bare append could write into that
+				// array's spare capacity; build a fresh slice and swap it in.
+				old := inf.podIPToServices[addr]
+				next := make([]ServiceEndpoint, 0, len(old)+1)
+				next = append(next, old...)
+				next = append(next, se)
+				inf.podIPToServices[addr] = next
+				added = append(added, sliceEndpointEntry{addr: addr, ep: se})
 			}
 		}
 	}
+	if len(added) > 0 {
+		inf.endpointsBySlice[key] = added
+	}
+}
+
+// removeSliceLocked removes every podIPToServices entry the named slice
+// contributed and forgets the slice. Caller must hold inf.mu.
+func (inf *Informer) removeSliceLocked(key string) {
+	entries, ok := inf.endpointsBySlice[key]
+	if !ok {
+		return
+	}
+	delete(inf.endpointsBySlice, key)
+	for _, e := range entries {
+		seps := inf.podIPToServices[e.addr]
+		for i, se := range seps {
+			if se == e.ep {
+				// Remove ONE matching instance, not all: during endpoint
+				// moves two slices can briefly advertise the same
+				// addr+service, and the sibling's entry must survive.
+				//
+				// Copy-on-write, same replace-don't-mutate invariant as the
+				// *PodMeta maps (see onNode): LookupService hands this slice
+				// to lock-free readers (pkg/agent reads svcs[0] after the
+				// RLock is released), so the published backing array must
+				// never be written again. An in-place
+				// append(seps[:i], seps[i+1:]...) would shift elements under
+				// a concurrent reader; build a fresh slice without index i
+				// and swap it in.
+				if len(seps) == 1 {
+					delete(inf.podIPToServices, e.addr)
+				} else {
+					next := make([]ServiceEndpoint, 0, len(seps)-1)
+					next = append(next, seps[:i]...)
+					next = append(next, seps[i+1:]...)
+					inf.podIPToServices[e.addr] = next
+				}
+				break
+			}
+		}
+	}
+}
+
+// onEndpointSliceDelete cleans up a deleted slice's entries. Handles the
+// DeletedFinalStateUnknown tombstone the informer delivers after a re-list.
+func (inf *Informer) onEndpointSliceDelete(obj interface{}) {
+	eps, ok := obj.(*discoveryv1.EndpointSlice)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		eps, ok = tombstone.Obj.(*discoveryv1.EndpointSlice)
+		if !ok {
+			return
+		}
+	}
+
+	inf.mu.Lock()
+	defer inf.mu.Unlock()
+	inf.removeSliceLocked(eps.Namespace + "/" + eps.Name)
 }
 
 // onService indexes a service's ClusterIP(s) so the agent can resolve a
@@ -529,6 +617,21 @@ func (inf *Informer) LookupClusterIP(ip string) (ServiceRef, bool) {
 	return ref, ok
 }
 
+// ClusterUID returns the kube-system namespace UID: a stable identifier that
+// is unique per cluster and constant for the cluster's lifetime (kube-system
+// cannot be deleted). The agent uses it to derive a cluster identity for the
+// NATS publish subject when -cluster is not set (DEC-019).
+func (inf *Informer) ClusterUID(ctx context.Context) (string, error) {
+	ns, err := inf.client.CoreV1().Namespaces().Get(ctx, "kube-system", metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get kube-system namespace: %w", err)
+	}
+	if ns.UID == "" {
+		return "", fmt.Errorf("kube-system namespace has an empty UID")
+	}
+	return string(ns.UID), nil
+}
+
 // extractContainerID strips the runtime prefix from a container ID.
 // Input: "containerd://abc123..." → "abc123..."
 // Input: "docker://abc123..." → "abc123..."
@@ -550,6 +653,3 @@ func IsAvailable() bool {
 	_, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 	return err == nil
 }
-
-// Needed to satisfy the compiler for metav1 import.
-var _ = metav1.NamespaceAll

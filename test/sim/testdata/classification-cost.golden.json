@@ -21,15 +21,23 @@
     "to": "replica",
     "traffic_type": "cross_region",
     "bytes": 1073741824,
-    "cost_usd": 0.02
+    "cost_usd": 0.01
   },
   {
-    "scenario": "internet-egress-tiered",
+    "scenario": "internet-egress-marginal",
     "from": "api",
     "to": "internet",
     "traffic_type": "internet_egress",
     "bytes": 5368709120,
-    "cost_usd": 0.36
+    "cost_usd": 0.44999999999999996
+  },
+  {
+    "scenario": "internet-egress-single-meter",
+    "from": "api",
+    "to": "internet",
+    "traffic_type": "internet_egress",
+    "bytes": 161061273600,
+    "cost_usd": 4.5
   },
   {
     "scenario": "intra-node",
@@ -53,7 +61,15 @@
     "to": "nat",
     "traffic_type": "nat_gateway",
     "bytes": 2147483648,
-    "cost_usd": 0.09
+    "cost_usd": 0.27
+  },
+  {
+    "scenario": "nat-gateway-route",
+    "from": "worker",
+    "to": "api-endpoint",
+    "traffic_type": "nat_gateway",
+    "bytes": 2147483648,
+    "cost_usd": 0.27
   },
   {
     "scenario": "same-zone",
@@ -69,7 +85,7 @@
     "to": "tgw-peer",
     "traffic_type": "transit_gateway",
     "bytes": 1073741824,
-    "cost_usd": 0.02
+    "cost_usd": 0.01
   },
   {
     "scenario": "transitive-attribution",
@@ -97,6 +113,14 @@
   },
   {
     "scenario": "vpc-peering",
+    "from": "api",
+    "to": "peer-db",
+    "traffic_type": "vpc_peering",
+    "bytes": 1073741824,
+    "cost_usd": 0.01
+  },
+  {
+    "scenario": "vpc-peering-rfc1918",
     "from": "api",
     "to": "peer-db",
     "traffic_type": "vpc_peering",

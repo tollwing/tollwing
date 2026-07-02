@@ -4,7 +4,9 @@
 
 ---
 
-> **Editions.** This document describes the full Tollwing system. The free, Apache-2.0 **open-source edition is the agent**: it attributes per-pod network cost across the 9 AWS billing paths and exposes `tollwing_*` Prometheus metrics that your Grafana reads directly, with no control-plane server. The **control plane** described below (the API server, ClickHouse storage, the alert/anomaly engine, recommendations, what-if, auto-remediation, multi-cluster aggregation, GCP/Azure, SSO/RBAC) is **Tollwing Enterprise** (self-hosted, license-gated, early access) and is not part of the open-source tree.
+> **Editions.** This document describes the full Tollwing system. The free, Apache-2.0 **open-source edition is the agent**: it attributes per-pod network cost across the 9 AWS billing paths and exposes `tollwing_*` Prometheus metrics that your Grafana reads directly, with no control-plane server. The **control plane** described below (the API server, ClickHouse storage, the alert/anomaly engine, recommendations, what-if, auto-remediation, multi-cluster aggregation, GCP/Azure, SSO/RBAC) is **Tollwing Enterprise** (self-hosted, license-gated, early access) and is not part of the open-source tree. The authoritative statement of that boundary is [`OPEN-CORE.md`](OPEN-CORE.md); §13 below summarizes it.
+>
+> **Document status.** This document describes the system as built, except where a passage is explicitly marked **(roadmap)** — those parts do not exist yet. If you find an unmarked passage describing code that is not in the tree, that is a documentation bug: fix it or mark it (per the living-documents discipline in [`CLAUDE.md`](CLAUDE.md)).
 
 ---
 
@@ -15,7 +17,7 @@
 |                              CONTROL PLANE                                         |
 |  +------------------+  +------------------+  +------------------+                  |
 |  |   API Server     |  |  Cost Engine     |  |  Alert Engine    |                  |
-|  |   (Go, gRPC+HTTP)|  |  (Go)            |  |  (Go)            |                  |
+|  |   (Go, REST/JSON)|  |  (Go)            |  |  (Go)            |                  |
 |  +--------+---------+  +--------+---------+  +--------+---------+                  |
 |           |                     |                     |                             |
 |  +--------+---------------------+---------------------+---------+                  |
@@ -51,10 +53,10 @@
 |  |  |  lifecycle)      |  |  pre-NAT capture)|  | tcp_cleanup_rbuf | |             |
 |  |  +------------------+  +------------------+  | (byte counters)  | |             |
 |  |  +------------------+  +------------------+  +------------------+ |             |
-|  |  | tracepoint:      |  | fentry:          |                      |             |
-|  |  | sock/inet_sock   |  | nf_conntrack     |                      |             |
-|  |  | _set_state       |  | _confirm         |                      |             |
-|  |  | (state changes)  |  | (NAT resolution) |                      |             |
+|  |  | cgroup/          |  | fentry:          |                      |             |
+|  |  | sock_release     |  | tcp_retransmit   |                      |             |
+|  |  | (close + UDP     |  | _skb (retransmit |                      |             |
+|  |  |  table cleanup)  |  |  accounting)     |                      |             |
 |  |  +------------------+  +------------------+                      |             |
 |  +------------------------------------------------------------------+             |
 |                                                                                    |
@@ -74,23 +76,26 @@ The design uses a layered hook strategy. Not every kernel supports every hook, s
 
 | Hook | Type | Purpose | Why This Hook |
 |------|------|---------|---------------|
-| `sock_ops` | `BPF_PROG_TYPE_SOCK_OPS` | Connection lifecycle events (established, close) | You already use this in our reference eBPF agent. Fires on `ACTIVE_ESTABLISHED_CB`, `PASSIVE_ESTABLISHED_CB`, `STATE_CB`. Gives 4-tuple + socket cookie. |
+| `sock_ops` | `BPF_PROG_TYPE_SOCK_OPS` | Connection lifecycle events (established, close) | Fires on `ACTIVE_ESTABLISHED_CB`, `PASSIVE_ESTABLISHED_CB`, `STATE_CB`. Gives 4-tuple + socket cookie. Close accounting fires on `TCP_CLOSE` only — half-closed states (`FIN_WAIT`, `CLOSE_WAIT`, …) still carry legal bytes and keep counting (P5). |
 | `cgroup/connect4` / `cgroup/connect6` | `BPF_PROG_TYPE_CGROUP_SOCK_ADDR` | Capture pre-NAT destination for ClusterIP resolution | **This is the critical hook Kubecost misses.** Fires BEFORE kube-proxy DNAT, so you see the original ClusterIP:port, not the pod IP. |
-| `kprobe/tcp_sendmsg` | kprobe | Byte counting per socket | Captures exact bytes sent per `sock`. Combined with socket cookie, gives per-connection egress bytes. |
-| `kprobe/tcp_cleanup_rbuf` | kprobe | Byte counting for received data | Captures bytes received. Combined with sendmsg, gives full bidirectional byte accounting. |
+| `fentry/tcp_sendmsg` (kprobe fallback) | fentry, kprobe on <5.11 | Byte counting per socket | Captures exact bytes sent per `sock`. Combined with socket cookie, gives per-connection egress bytes. fentry is preferred (reliable `bpf_get_socket_cookie` with `struct sock *`); the loader probes and falls back to the kprobe. |
+| `fentry/tcp_cleanup_rbuf` (kprobe fallback) | fentry, kprobe on <5.11 | Byte counting for received data | Captures bytes received. Combined with sendmsg, gives full bidirectional byte accounting. |
 
-**Secondary Hooks (optional, for enhanced accuracy):**
+**Secondary Hooks (optional — probed at load, degrade gracefully):**
 
 | Hook | Type | Purpose | Kernel Req |
 |------|------|---------|------------|
-| `fentry/nf_conntrack_confirm` | fentry/fexit | Capture conntrack NAT mapping (pre-DNAT -> post-DNAT) | 5.11+ |
-| `tracepoint/sock/inet_sock_set_state` | tracepoint | TCP state transitions (SYN_SENT, ESTABLISHED, CLOSE_WAIT, etc.) | 4.16+ |
-| `cgroup/sock_release` | cgroup | Detect socket close for final byte tallying | 5.8+ |
-| `fentry/ip_route_output_flow` | fentry | Capture routing decisions (which interface, next hop) for egress classification | 5.11+ |
+| `cgroup/sock_release` | cgroup | Final byte tally on socket close; deletes UDP entries from the `connections` map (which otherwise have no close event and would only leave via LRU eviction) | 5.8+ |
+| `fentry/tcp_retransmit_skb`, `fentry/tcp_send_loss_probe` | fentry | Retransmit accounting (`tollwing_retransmit_*` metrics — wasted, re-billed bytes) | 5.11+ |
+| `fentry/udp_sendmsg` | fentry | UDP TX byte counting (enabled with `-udp`) | 5.11+ |
+| `fentry`/`fexit` on `udp_recvmsg` (`dns.bpf.c`) | fentry/fexit | DNS answer capture for destination enrichment | 5.11+ |
+| TC egress QUIC classifier (`quic.bpf.c`) | TCX link (6.6+) or legacy tc filter | QUIC/HTTP3 flow detection on the wire; the poller deduplicates against socket-level UDP accounting so nothing double-counts | 5.10+ |
+
+> The `fentry/nf_conntrack_confirm` NAT-resolution hook that earlier revisions listed here was removed per [DEC-016](decisions/DEC-016-remove-dormant-cgroup-storage-iterator-and-conntrack-machinery.md): it wrote per-packet into a map nothing read. Pre-DNAT intent comes from the two-phase capture (§2.2); NAT *gateway* detection is a cloud-API concern, not a kernel one (§4.3, [DEC-015](decisions/DEC-015-route-based-nat-detection-and-hourly-charges.md)).
 
 **NOT using XDP:** XDP fires too early (before socket association), so you cannot attribute traffic to processes. XDP is useful for packet-level inspection but not for cost attribution. The overhead of copying full packets is also unacceptable.
 
-**NOT using tc/cls_bpf:** Same problem as XDP for attribution. Useful only if you need to inspect packet headers for protocol classification, which is better done at the socket level.
+**NOT using tc/cls_bpf for attribution:** Same problem as XDP — no process context. The one TC program we ship (the optional QUIC egress classifier above) does protocol *detection* only; attribution still happens at the socket layer, and socket-level accounting wins when both see the same flow.
 
 ### 2.2 The ClusterIP Problem (and the Solution)
 
@@ -114,15 +119,18 @@ This gives you:
   - Connection-level granularity tied to the originating process
 ```
 
-For service meshes (Istio/Linkerd), the same approach works because `cgroup/connect4` fires before the sidecar proxy's iptables rules redirect traffic. If the mesh uses eBPF (Cilium), we detect this and read Cilium's own maps for service identity.
+For service meshes (Istio/Linkerd), the same approach works because `cgroup/connect4` fires before the sidecar proxy's iptables rules redirect traffic; sidecar-internal loopback legs are classified `service_mesh_internal` so mesh overhead is visible without inflating same-zone aggregates. Reading an eBPF mesh's (Cilium's) own service maps for identity is **(roadmap)** — today those clusters rely on the same pre-DNAT capture.
 
 ### 2.3 BPF Map Architecture
+
+The authoritative definitions live in `pkg/ebpf/bpf/maps.h`; this is the map inventory (abridged — IPv6 fields and retransmit counters elided here, present in the source):
 
 ```c
 // ====== CONNECTION TRACKING ======
 
 // Primary connection table. Keyed by socket cookie (u64).
-// Updated on establish, read on byte count, deleted on close.
+// Updated on establish, read on byte count, deleted on TCP_CLOSE
+// (TCP) or cgroup/sock_release (UDP).
 struct conn_info {
     u32 src_ip;
     u32 dst_ip;
@@ -130,15 +138,14 @@ struct conn_info {
     u16 src_port;
     u16 dst_port;
     u16 original_dst_port;  // pre-DNAT port
-    u32 pid;                // tgid from bpf_get_current_pid_tgid()
-    u32 cgroupid;           // from bpf_get_current_cgroup_id()
-    u64 start_ns;           // bpf_ktime_get_ns()
-    u64 tx_bytes;           // atomically updated by tcp_sendmsg hook
-    u64 rx_bytes;           // atomically updated by tcp_cleanup_rbuf hook
+    u8  family;             // AF_INET=2, AF_INET6=10
     u8  protocol;           // TCP=6, UDP=17
-    u8  state;              // current TCP state
-    u8  direction;          // 0=outgoing, 1=incoming
-    u8  reserved;
+    u32 pid;                // tgid from bpf_get_current_pid_tgid()
+    u64 cgroupid;           // from bpf_get_current_cgroup_id()
+    u64 start_ns;           // bpf_ktime_get_ns()
+    u64 tx_bytes;
+    u64 rx_bytes;
+    /* … retransmit counters, direction/state, IPv6 addresses … */
 };
 
 struct {
@@ -150,26 +157,20 @@ struct {
 
 // ====== PRE-DNAT RESOLUTION ======
 
-// Populated by cgroup/connect4, read by sock_ops.
-// Short-lived: entries removed after sock_ops reads them.
-struct original_dst {
-    u32 ip;
-    u16 port;
-    u16 pad;
-};
-
+// Populated by cgroup/connect4/6, read by sock_ops.
+// Short-lived: entries removed after sock_ops correlates them.
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, u64);              // socket cookie
-    __type(value, struct original_dst);
+    __type(value, struct original_dst); // ip/port + pid, cgroup, comm
 } cookie_to_original_dst SEC(".maps");
 
 // ====== AGGREGATION (in-kernel rollup) ======
 
-// Per-flow byte counters, flushed to userspace periodically.
-// Key is a 5-tuple hash. Value accumulates bytes.
-// This reduces perf event volume by 100-1000x.
+// Per-flow byte counters, drained atomically by the poller each tick
+// (batch LookupAndDelete where the kernel supports it).
+// This reduces event volume by 100-1000x versus per-call events.
 struct flow_key {
     u32 src_ip;
     u32 dst_ip;
@@ -181,28 +182,34 @@ struct flow_key {
     u16 pad;
 };
 
-struct flow_metrics {
-    u64 tx_bytes;
-    u64 rx_bytes;
-    u64 conn_count;
-    u64 last_updated_ns;
-};
-
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-    __uint(max_entries, 131072);  // 128K unique flows per CPU
+    __uint(max_entries, 131072);  // 128K unique flows per CPU;
+                                  // keys include the ephemeral src_port,
+                                  // so this is sized for churn
     __type(key, struct flow_key);
-    __type(value, struct flow_metrics);
+    __type(value, struct flow_metrics); // tx/rx bytes, conn count,
+                                        // retransmits, last_updated_ns
 } flow_aggregates SEC(".maps");
+
+// ====== DROP ACCOUNTING (P4: losses are counted, never silent) ======
+
+// Incremented on every ringbuf-reserve failure and map-full insert;
+// mirrored into tollwing_ringbuf_drops_total /
+// tollwing_map_update_drops_total by the exporter.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    /* one slot per drop category */
+} drop_counters SEC(".maps");
 
 // ====== CONFIGURATION ======
 
 struct agent_config {
     u8  enabled;
-    u8  track_udp;         // also hook UDP (for DNS cost attribution)
-    u8  sample_rate;       // 1 = every conn, N = 1/N sampling for high throughput
+    u8  track_udp;         // also hook UDP (for DNS/QUIC cost attribution)
+    u8  sample_rate;       // 1 = every conn, N = 1/N sampling
     u8  reserved[5];
-    u64 aggregation_ns;    // flush interval (default: 5s = 5_000_000_000)
+    u64 aggregation_ns;    // flush interval (default: 5s)
 };
 
 struct {
@@ -212,13 +219,15 @@ struct {
     __type(value, struct agent_config);
 } agent_config SEC(".maps");
 
-// ====== EVENTS (for connection lifecycle, not byte counting) ======
+// ====== EVENTS (connection lifecycle, not byte counting) ======
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 22);  // 4MB ring buffer
 } events SEC(".maps");
 ```
+
+Also present: `quic_flows` (PERCPU_HASH fed by the TC QUIC classifier; deduplicated against socket-level UDP in the poller), `sidecar_storage` (mesh-sidecar detection), and the `dns_events` ring buffer in `dns.bpf.c`. Three maps earlier revisions documented — `nat_mappings`, `cgroup_cost_storage`, and the sk-storage iterator source — were removed per [DEC-016](decisions/DEC-016-remove-dormant-cgroup-storage-iterator-and-conntrack-machinery.md) (dormant machinery with per-packet cost and no consumer).
 
 ### 2.4 Performance Budget: Staying Under 1% CPU
 
@@ -232,7 +241,9 @@ struct {
 
 **Strategy 5: LRU maps with appropriate sizing.** LRU eviction means we never block on a full map. Size connections at 512K entries (about 40MB of kernel memory), which covers even the busiest nodes.
 
-**Measured overhead expectation:** Based on comparable tools (Cilium Hubble, Pixie), the combined overhead of sock_ops + kprobe/tcp_sendmsg + kprobe/tcp_cleanup_rbuf + in-kernel aggregation should be 0.1-0.5% CPU on a node handling 100K active connections.
+**Strategy 6: count what gets dropped.** Ring-buffer reserve failures and map-full inserts increment the `drop_counters` map, exported as `tollwing_ringbuf_drops_total` / `tollwing_map_update_drops_total`. Per P4, data loss under pressure is measured and visible, never silent.
+
+**Overhead budget (an expectation, not yet a published measurement):** Based on comparable tools (Cilium Hubble, Pixie — Pixie publishes <5%, typically <2%, for full protocol tracing, which is far heavier than flow accounting), the combined overhead of sock_ops + the byte-count fentry/kprobes + in-kernel aggregation should be 0.1–0.5% of one core on a node handling 100K active connections. We do not publish this as a measured number; a reproducible benchmark (`make bench`-style, with instance type, kernel, and flow rate stated) is **(roadmap)**, and public claims are qualified until it lands.
 
 ---
 
@@ -273,8 +284,8 @@ struct {
 |                    +-----------+     +-----+-----+                |
 |                                            |                      |
 |                                      +-----+-----+                |
-|                                      | NATS /     |                |
-|                                      | gRPC Export|                |
+|                                      | NATS       |                |
+|                                      | Export     |                |
 |                                      +-----------+                |
 +-------------------------------------------------------------------+
 ```
@@ -283,21 +294,23 @@ struct {
 
 **BPF Loader** (pattern from our reference eBPF agent's `Manager`):
 - Loads CO-RE objects via `cilium/ebpf.LoadCollectionSpecFromReader`
-- Probes kernel features (extending our reference eBPF agent's `features.go` pattern)
-- Graceful degradation: if `fentry/nf_conntrack_confirm` is unavailable, fall back to `cgroup/connect4`-only mode
-- Pushes config to BPF maps (same pattern as our reference eBPF agent's `pushConfig()`)
+- Probes kernel features (`features.go`: `HaveSockOps`, `HaveCgroupConnect4`, `HaveRingBuf`, `HaveFentry`, `HaveTCX`, …) — every probe tests the actual capability it claims (DEC-016 fixed a TCX probe that reported "supported" on every kernel since 4.1)
+- Graceful degradation: fentry byte counters fall back to kprobes; TCX falls back to a legacy tc filter; optional programs (retransmit, DNS, UDP, QUIC, sock_release) degrade to warn-and-continue
+- Pushes config to BPF maps (`pushConfig()`)
 
 **Map Poller:**
 - Runs on a configurable tick (default 5s)
-- Iterates `flow_aggregates` PERCPU_HASH, sums per-CPU values, resets entries
-- Reads `connections` map for new/closed connections via ring buffer
-- Batch iteration with `MapBatchLookupAndDelete` for efficiency
+- Drains `flow_aggregates` (PERCPU_HASH) with batch `LookupAndDelete` where the kernel supports it (5.14+), atomic per-key `LookupAndDelete` otherwise — the drain is delta-safe: bytes counted between read and delete are never lost, and the sole pre-5.6 lossy fallback warns once
+- Reads connection lifecycle events from the ring buffer
+- Deduplicates TC-observed QUIC flows against socket-level UDP accounting (the socket-level entry wins)
+- Reads `drop_counters` each tick and feeds the exporter's drop metrics
 
 **Metadata Cache** (the enrichment layer):
 - **Process metadata:** `/proc/<pid>/cgroup` to get container ID, `/proc/<pid>/comm` and `/proc/<pid>/cmdline` for process name. Cached by PID with TTL.
-- **Container/Pod metadata:** Kubernetes informer (client-go SharedInformerFactory) watching Pods. Maps container ID to pod name, namespace, labels, node, zone. For non-K8s: Docker API or containerd CRI.
-- **Zone resolution:** On startup, query IMDS (AWS: `http://169.254.169.254/latest/meta-data/placement/availability-zone`, GCP: metadata server, Azure: IMDS). Cache the local node's zone. For remote IPs, resolve via the Kubernetes Node object's `topology.kubernetes.io/zone` label.
-- **Service resolution:** Watch Kubernetes Services and Endpoints/EndpointSlices. Build a reverse map: pod IP:port -> service name. Combined with the pre-DNAT capture from `cgroup/connect4`, gives full service attribution.
+- **Container/Pod metadata:** Kubernetes informer (client-go SharedInformerFactory) watching Pods. Maps container ID to pod name, namespace, labels, node, zone. Non-Kubernetes enrichment (Docker API / containerd CRI) is **(roadmap)** — on bare VMs today the agent enriches from `/proc` and IMDS only.
+- **Zone resolution:** On startup, query IMDS (AWS: `http://169.254.169.254/latest/meta-data/placement/availability-zone`, GCP: metadata server, Azure: IMDS — Azure zone ordinals are region-qualified, e.g. `eastus-1`, so bare `"1"`s from different regions never compare equal). Cache the local node's zone. For remote IPs, resolve via the Kubernetes Node object's `topology.kubernetes.io/zone` label.
+- **Service resolution:** Watch Kubernetes Services and EndpointSlices. Build a reverse map: pod IP:port -> service name, with per-slice bookkeeping (each slice's contributions are tracked individually, so a single-slice update on a >100-endpoint service never wipes its sibling slices, and slice/service deletions drain exactly their own entries). Combined with the pre-DNAT capture from `cgroup/connect4`, gives full service attribution.
+- **Cluster identity:** resolved once at startup — explicit `-cluster` flag, else derived from the kube-system namespace UID (stable, unique per cluster). An invalid or unresolvable identity **fails the agent fast** at startup rather than silently dropping every NATS publish ([DEC-019](decisions/DEC-019-cluster-identity-fail-fast-nats-subject.md)).
 
 **Traffic Classifier** (see Section 4 in detail).
 
@@ -306,10 +319,10 @@ struct {
 - Produces three tiers: raw flows (short retention), service aggregates (medium retention), cost summaries (long retention)
 
 **Exporters:**
-- Prometheus remote write (for Grafana integration)
-- NATS JetStream publish (for control plane consumption)
-- Local Prometheus `/metrics` endpoint for scraping
-- Optional OTLP export
+- Local Prometheus `/metrics` endpoint (`:9990/metrics`, the `tollwing_*` series) — the complete free-tier output; your Prometheus scrapes it
+- NATS JetStream publish (for Enterprise control-plane consumption)
+- On shutdown, the poller's final flush publishes **before** the NATS connection drains and eBPF detaches last — a rolling restart loses no poll interval
+- Prometheus remote write and OTLP export are **(roadmap)**
 
 ### 3.4 Process-Level Attribution
 
@@ -322,49 +335,48 @@ PID -> /proc/<pid>/cgroup -> container ID
      -> /proc/<pid>/cmdline -> full command line
 ```
 
-For non-containerized workloads (VMs), the PID directly gives the process. For serverless (Lambda, Cloud Functions), the agent runs as a sidecar extension and captures the function invocation context.
+For non-containerized workloads (VMs), the PID directly gives the process. Serverless attribution (Lambda/Cloud Functions extensions) is **(roadmap)** — nothing ships for it today.
 
 ---
 
 ## 4. TRAFFIC CLASSIFICATION ENGINE
 
-This is the core differentiator. The classifier must determine the traffic type for every flow with zero guesswork.
+This is the core differentiator. The classifier determines the traffic type for every flow **deterministically**: every branch is decided by observed facts (hints from the enricher, operator/cloud-fed prefix sets, zone data). Anything it cannot prove is classified `Unknown` — never guessed (P5, [DEC-010](decisions/DEC-010-clusterip-dialer-side-cross-az-attribution.md)). The full type set is defined by `classifier.TrafficType` (the canonical owner of the wire strings, P6): the 9 billed paths plus `intra_node`, `service_mesh_internal`, and `unknown`.
 
 ### 4.1 Classification Decision Tree
 
-```
-For each flow (src_ip, dst_ip, original_dst_ip, src_zone, dst_zone):
+The implemented order (`pkg/classifier/traffic.go`, `Classify`):
 
-1. Is dst_ip a private IP (RFC 1918 / RFC 4193)?
-   |
-   +-- YES: Internal traffic
-   |   |
-   |   +-- Is src_zone == dst_zone?
-   |   |   +-- YES: SAME_ZONE (free on all clouds)
-   |   |   +-- NO:  Is same region?
-   |   |       +-- YES: CROSS_AZ (charged on AWS/Azure, free on GCP intra-region)
-   |   |       +-- NO:  CROSS_REGION (charged everywhere)
-   |   |
-   |   +-- Is dst_ip a known NAT gateway internal IP?
-   |       +-- YES: Reclassify based on NAT gateway's actual destination
-   |
-   +-- NO: External traffic
-       |
-       +-- Is dst_ip in a known VPC peering CIDR?
-       |   +-- YES: VPC_PEERING (charged per GB on AWS)
-       |
-       +-- Is dst_ip in a known Transit Gateway CIDR?
-       |   +-- YES: TRANSIT_GATEWAY (charged per GB + per hour)
-       |
-       +-- Does the route go through a NAT Gateway?
-       |   +-- YES: NAT_GATEWAY_EGRESS (charged per GB + per hour)
-       |   +-- NO:  INTERNET_EGRESS (charged per GB, tiered pricing)
-       |
-       +-- Is dst_ip a cloud service endpoint (S3, DynamoDB, etc.)?
-           +-- YES: Is it a VPC endpoint or public endpoint?
-               +-- VPC_ENDPOINT: cheaper
-               +-- PUBLIC_ENDPOINT: charged as internet egress
 ```
+For each flow (dst_ip, original_dst_ip, hints, zones):
+
+1. Sidecar hint from the enricher?          -> SERVICE_MESH_INTERNAL ($0, tracked)
+2. Intra-node hint or loopback dst?         -> INTRA_NODE ($0, tracked)
+3. dst in a cluster-internal CIDR
+   (operator-supplied or informer-fed)?
+   +-- src_zone and dst_zone both known?
+   |   +-- equal            -> SAME_ZONE (free on all clouds)
+   |   +-- same region      -> CROSS_AZ  (charged on AWS/GCP; free on Azure)
+   |   +-- different region -> CROSS_REGION
+   +-- a zone is unknown    -> UNKNOWN (never assume same-zone;
+                                the dialer-side ClusterIP leg lands
+                                here by design, DEC-003/DEC-010)
+4. dst is RFC 1918 / link-local (not cluster-internal)?
+   -- topology prefixes are consulted BEFORE zone fallback,
+      because real VPC peers are almost always RFC 1918:
+   +-- dst is a known NAT gateway ENI IP    -> NAT_GATEWAY
+   +-- dst in a VPC-peering prefix          -> VPC_PEERING
+   +-- dst in a Transit-Gateway prefix      -> TRANSIT_GATEWAY
+   +-- dst in a VPC-endpoint prefix         -> VPC_ENDPOINT
+   +-- else: zone comparison as in (3), UNKNOWN if unprovable
+5. Public destination:
+   +-- dst in a peering / TGW / endpoint prefix  -> as above
+   +-- the node's subnet default-routes via a
+       NAT gateway (route-table fact, §4.3)      -> NAT_GATEWAY
+   +-- else                                      -> INTERNET_EGRESS
+```
+
+`cloud_service_public` is not inferred from IP prefixes — it is a DNS/enrichment outcome (a flow to a provider service's public endpoint identified by name). Published provider IP ranges (`ip-ranges.json` and friends) are deliberately **not** fed into the endpoint prefix set: a public range says nothing about whether *this* VPC has an endpoint for it, and doing so once priced public-EC2 traffic at $0.01/GB "vpc_endpoint" instead of ~$0.09/GB egress ([DEC-015](decisions/DEC-015-route-based-nat-detection-and-hourly-charges.md)).
 
 ### 4.2 Zone Resolution Strategy
 
@@ -383,38 +395,39 @@ For each flow (src_ip, dst_ip, original_dst_ip, src_zone, dst_zone):
 |      v                                                         |
 |  [CIDR-to-Zone Map]  -- Does IP fall in a known subnet? -->    |
 |      |                   Return zone from subnet mapping       |
-|      |                   (populated from cloud API on startup) |
+|      |                   (populated from the cloud subnet API, |
+|      |                    replace-on-refresh every 5 minutes)  |
 |      v                                                         |
-|  [Cloud API Fallback]  -- Query cloud API for subnet/zone     |
-|      |                    Cache result. Rate-limited.          |
-|      v                                                         |
-|  [Unknown]  -- Mark as UNKNOWN, alert, request manual config   |
+|  [Unknown]  -- classify UNKNOWN; never assume a zone (P5).     |
+|               Per-IP cloud-API fallback lookups are (roadmap). |
 +---------------------------------------------------------------+
 ```
 
 The CIDR-to-zone map is the key innovation. On startup, the agent queries:
 - **AWS:** `ec2:DescribeSubnets` to get subnet CIDR -> AZ mapping
-- **GCP:** `compute.subnetworks.list` for subnet -> region mapping (GCP does not charge cross-AZ within a region, so region granularity suffices)
-- **Azure:** `network/virtualNetworks` API for subnet -> zone mapping
+- **GCP:** `compute.subnetworks.list` — GCP subnets are **regional**, so they contribute **no** CIDR-to-zone entries: mapping a regional CIDR to any single zone would make real cross-zone traffic (charged $0.01/GiB since GCP introduced inter-zone pricing) read as free `same_zone`. Zone facts on GCP come from per-IP sources (node labels via the informer); without them the classification is an honest `Unknown` ([DEC-015](decisions/DEC-015-route-based-nat-detection-and-hourly-charges.md))
+- **Azure:** `network/virtualNetworks` API for subnet -> zone mapping, with bare zone ordinals region-qualified (`QualifyAzureZone("eastus","1")` = `eastus-1`) so cross-AZ never misreads as cross-region
 
-This map is refreshed every 5 minutes and shared across agents via the control plane.
+Each agent refreshes this map itself every 5 minutes (`cloud.TopologyRefresher`); sharing one leader-fetched copy across agents via the control plane is **(roadmap)**. Every `Set*CIDRs` feed is replace-on-refresh: the classifier's prefix tree always equals the latest topology snapshot, so deleted peerings stop classifying within one refresh and the tree stays bounded (P2).
 
 ### 4.3 NAT Gateway Detection
 
-NAT gateways are invisible at the socket layer. The agent detects NAT gateway traffic by:
+NAT gateways are invisible at the socket layer — an internet-bound flow's destination is the internet IP, never the NAT ENI, so IP matching alone can never attribute NAT data-processing spend. Per [DEC-015](decisions/DEC-015-route-based-nat-detection-and-hourly-charges.md), detection is **route-based**:
 
-1. Reading the routing table (`ip route get <dst>`) to check if a route goes through a known NAT gateway IP
-2. On AWS: Querying `ec2:DescribeNatGateways` to get NAT gateway ENI IPs
-3. Correlating: if a flow's next hop matches a NAT gateway ENI, classify as NAT_GATEWAY_EGRESS
-4. The optional `fentry/ip_route_output_flow` hook gives real-time routing decisions without shelling out
+1. On AWS, the provider resolves the node's subnet (config override or IMDS MAC lookup) and inspects `ec2:DescribeRouteTables` — the subnet's associated table, or the VPC main table when unassociated — for a `0.0.0.0/0` route targeting a NAT gateway (`aws.Provider.NodeRoutesViaNAT`).
+2. `cloud.TopologyRefresher` feeds the result to `classifier.SetDefaultRouteNAT`: internet-bound flows from NAT-routed subnets classify `nat_gateway`.
+3. `ec2:DescribeNatGateways` still supplies NAT ENI IPs; flows addressed *to* the ENI itself match directly.
+4. Pricing: a NAT-classified flow costs NAT per-GB processing **plus** the internet-DTO leg on its Tx bytes. The gateway's fixed *hourly* charge is deliberately **not** spread across flows (that would require inventing a utilization share, violating P4/P5); it surfaces in billing reconciliation's explicit unaccounted bucket (§5.3).
+
+Known limits (recorded in DEC-015): route-based detection is **AWS-only** today — GCP/Azure NAT-routed internet flows still classify `internet_egress`, under-reporting their NAT processing component; and detection is subnet-granular (the default route stands in for per-prefix routes).
 
 ### 4.4 VPC Peering and Transit Gateway Detection
 
-On startup, query:
+On startup and every refresh, query:
 - **AWS:** `ec2:DescribeVpcPeeringConnections`, `ec2:DescribeTransitGatewayAttachments`
-- Map peering CIDRs and TGW attachment CIDRs into the classifier's lookup table
-- Any flow destined to a peering CIDR is classified as VPC_PEERING
-- Any flow routed through a TGW attachment is TRANSIT_GATEWAY
+- Map peering CIDRs and TGW attachment CIDRs into the classifier's lookup table (replace-on-refresh, §4.2)
+- Any flow destined to a peering CIDR is classified as VPC_PEERING; a TGW attachment CIDR is TRANSIT_GATEWAY — these prefixes are consulted *before* zone fallback for RFC 1918 destinations, since real VPC peers are almost always RFC 1918
+- VPC-endpoint prefixes come from explicit operator configuration; deriving them automatically from deployed endpoints (`ec2:DescribeVpcEndpoints`) is **(roadmap)** — published provider ranges are never used as a stand-in (§4.1)
 
 ---
 
@@ -422,32 +435,36 @@ On startup, query:
 
 ### 5.1 Rate Card Model
 
-```go
-// TrafficType enumeration
-type TrafficType int
-const (
-    SameZone TrafficType = iota
-    CrossAZ
-    CrossRegion
-    InternetEgress
-    NATGateway
-    VPCPeering
-    TransitGateway
-    VPCEndpoint
-    CloudServicePublic
-)
+The rate card — not the engine — is the authority on billing semantics ([DEC-014](decisions/DEC-014-metered-directions-and-marginal-default-pricing.md)). The `TrafficType` enumeration is owned by `pkg/classifier` (§4, P6); the card lives in `pkg/cost`:
 
-// RateCard holds per-GB pricing for a cloud provider + region
+```go
+// RateCard holds per-GB pricing AND billing semantics for a provider + region.
 type RateCard struct {
-    Provider    string            // "aws", "gcp", "azure"
-    Region      string            // "us-east-1"
-    Rates       map[TrafficType]TieredRate
-    NATGateway  NATGatewayRate    // per-hour + per-GB
-    TransitGW   TransitGWRate     // per-attachment-hour + per-GB
-    LastUpdated time.Time
+    Provider   string            // "aws", "gcp", "azure"
+    Region     string            // "us-east-1"
+    Rates      map[classifier.TrafficType]TieredRate
+    NATGateway NATGatewayRate    // per-hour + per-GB
+    TransitGW  TransitGWRate     // per-attachment-hour + per-GB
+
+    // Directions states which side(s) of a flow are billable, per
+    // traffic type, from the observing node's perspective: AWS
+    // cross-AZ meters Tx+Rx ($0.01/GB each direction); internet
+    // egress, cross-region, and TGW meter Tx only; GCP meters the
+    // sender; Azure cross-AZ meters nothing (charges retired 2024).
+    // The engine bills only MeteredBytes(tt, tx, rx).
+    Directions map[classifier.TrafficType]MeteredDirection
+
+    LastUpdated time.Time // dates the rates (P4) — for the built-in
+                          // defaults this is the verification date
+                          // (2026-07-02), never time.Now()
+    Source      string    // e.g. "aws-price-list-api", or the dated
+                          // defaults label
+    Fallback    bool      // true when defaults substitute for live
+                          // pricing — a stale default must look stale,
+                          // never silently pass as fresh (P4)
 }
 
-// TieredRate supports volume-based pricing (e.g., AWS internet egress)
+// TieredRate supports volume-based pricing (e.g., AWS internet egress).
 type TieredRate struct {
     Tiers []Tier  // sorted by threshold ascending
 }
@@ -458,20 +475,19 @@ type Tier struct {
 }
 ```
 
+**Pricing modes** (`cost.EngineConfig`, DEC-014): the default is `PricingModeMarginal` — every metered GB prices at the marginal post-free-tier list rate (`TieredRate.MarginalRate()`), with **no cumulative state**. That is the only honest default for a distributed fleet: N per-node engines each tracking "the account's" free tier would grant it N times and reset it on every restart. `PricingModeSingleMeter` (explicit opt-in via `cost.NewEngineWithConfig`) applies the full tier table cumulatively and is valid only where exactly one engine meters all the account's traffic — the Enterprise server's aggregation path. Even then the true tier position belongs to CUR reconciliation (§5.3), which sees non-Kubernetes spend too.
+
 ### 5.2 Rate Card Sources
 
-| Provider | Data Source | Update Frequency |
+| Provider | Live source (`pkg/cloud/*/pricing.go`) | Fallback |
 |----------|-----------|-----------------|
-| AWS | AWS Price List API (`/offers/v1.0/aws/AmazonEC2/current/`) + Savings Plans API | Daily |
-| GCP | Cloud Billing Catalog API (`services.skus.list`) | Daily |
-| Azure | Retail Prices API (`https://prices.azure.com/api/retail/prices`) | Daily |
+| AWS | AWS Price List API (`GetProducts`), `Source: "aws-price-list-api"` | Dated defaults, `Fallback: true` |
+| GCP | Cloud Billing Catalog API | Dated defaults, `Fallback: true` |
+| Azure | Retail Prices API (`https://prices.azure.com/api/retail/prices`) | Dated defaults, `Fallback: true` |
 
-**Committed/Reserved Pricing:** The cost engine queries:
-- AWS: Savings Plans utilization via Cost Explorer API
-- GCP: Committed Use Discounts via Billing API
-- Azure: Reserved Instance utilization via Consumption API
+The agent's 6-hour rate-card refresher wires the live AWS pricing client (the OSS build is AWS-scoped, §13); on failure it warns loudly and falls back to the built-in defaults, which carry their list-price verification date (2026-07-02, sources in DEC-014) — a rate without a date is untraceable (P4). A provider that cannot fetch live pricing returns its default card marked `Fallback: true` instead of silently substituting it.
 
-And applies the effective rate (not list rate) to traffic calculations.
+**Committed/discounted pricing:** list rates are what the agent can honestly compute from bytes alone. Your *actual discounted* rates (Savings Plans, CUDs, private pricing) enter through CUR reconciliation (§5.3, Enterprise), which compares metered traffic against the real bill. Querying commitment APIs to pre-apply effective rates per flow is **(roadmap)**.
 
 ### 5.3 Billing Reconciliation
 
@@ -504,6 +520,8 @@ And applies the effective rate (not list rate) to traffic calculations.
 +-------------------------------------------------------------------+
 ```
 
+Fixed hourly charges (NAT gateway hours, TGW attachment hours) are **not** attributed per flow — a per-flow dollar must be that flow's bytes × a dated rate (P4), and spreading a fixed charge requires inventing a utilization share (P5). They land in the reconciliation's explicit **unaccounted** bucket, where the drift report names them ([DEC-015](decisions/DEC-015-route-based-nat-detection-and-hourly-charges.md)).
+
 AWS billing integration:
 - **Cost and Usage Report (CUR):** S3-delivered Parquet files, contains per-resource-hour costs. Parse `lineItem/UsageType` for `DataTransfer-*` line items.
 - **Cost Explorer API:** For on-demand queries. Rate-limited; cache aggressively.
@@ -517,15 +535,11 @@ Azure:
 ### 5.4 Handling Managed Services
 
 For traffic to/from managed services (RDS, ElastiCache, S3, etc.):
-- The agent running on the node sees outbound connections to managed service IPs
-- Classify by matching destination IP against known cloud service CIDR ranges (published by each cloud)
-- AWS publishes `ip-ranges.json`; GCP publishes IP ranges; Azure publishes Service Tags
-- Attribute the cost to the pod/process that initiated the connection
+- The agent running on the node sees outbound connections to managed service IPs and attributes the cost to the pod/process that initiated the connection
+- Identifying a destination as a *named* cloud service (`cloud_service_public`) is a DNS/enrichment outcome, not an IP-prefix inference
+- Published provider ranges (`ip-ranges.json`, GCP ranges, Azure Service Tags) are deliberately **not** used to classify — matching against them once priced public-EC2/internet traffic as cheap `vpc_endpoint` traffic ([DEC-015](decisions/DEC-015-route-based-nat-detection-and-hourly-charges.md)); without endpoint knowledge the honest classification for a public address is the default egress path
 
-For serverless (Lambda):
-- Deploy the agent as a Lambda extension (lightweight sidecar)
-- Uses the same eBPF hooks but scoped to the function's cgroup
-- Reports per-invocation traffic costs
+Serverless (Lambda-extension agent, per-invocation traffic costs) is **(roadmap)**.
 
 ---
 
@@ -575,33 +589,36 @@ CREATE TABLE flows (
     dst_pod         String,
     dst_service     String,
     dst_zone        LowCardinality(String),
-    traffic_type    Enum8('same_zone'=0, 'cross_az'=1, 'cross_region'=2,
-                          'internet_egress'=3, 'nat_gateway'=4,
-                          'vpc_peering'=5, 'transit_gateway'=6),
+    traffic_type    Enum8('unknown'=0, 'same_zone'=1, 'cross_az'=2,
+                          'cross_region'=3, 'internet_egress'=4,
+                          'nat_gateway'=5, 'vpc_peering'=6,
+                          'transit_gateway'=7, 'vpc_endpoint'=8,
+                          'cloud_service_public'=9),
     tx_bytes        UInt64,
     rx_bytes        UInt64,
     connections     UInt32,
+    retransmit_bytes UInt64 DEFAULT 0,
+    retransmit_count UInt32 DEFAULT 0,
     cost_usd        Float64
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (cluster, src_namespace, dst_service, timestamp)
-TTL timestamp + INTERVAL 30 DAY;
+TTL toDateTime(timestamp) + INTERVAL 30 DAY;
 
 -- Service cost summary (materialized view, automatic rollup)
-CREATE MATERIALIZED VIEW service_costs_hourly
+CREATE MATERIALIZED VIEW IF NOT EXISTS service_costs_hourly
 ENGINE = SummingMergeTree()
-PARTITION BY toYYYYMMDD(timestamp)
+PARTITION BY toYYYYMMDD(hour)
 ORDER BY (cluster, src_namespace, src_pod, dst_service, traffic_type, hour)
 AS SELECT
-    toStartOfHour(timestamp) as hour,
+    toStartOfHour(timestamp) AS hour,
     cluster, src_namespace, src_pod, dst_service, traffic_type,
-    sum(tx_bytes) as tx_bytes,
-    sum(rx_bytes) as rx_bytes,
-    sum(connections) as connections,
-    sum(cost_usd) as cost_usd,
-    timestamp
+    sum(tx_bytes) AS tx_bytes,
+    sum(rx_bytes) AS rx_bytes,
+    sum(connections) AS connections,
+    sum(cost_usd) AS cost_usd
 FROM flows
-GROUP BY hour, cluster, src_namespace, src_pod, dst_service, traffic_type, timestamp;
+GROUP BY hour, cluster, src_namespace, src_pod, dst_service, traffic_type;
 ```
 
 ### 6.3 Why ClickHouse Over Pure Prometheus
@@ -626,9 +643,9 @@ Prometheus is still used at the node level for real-time metrics and alerting vi
 |                                                                    |
 |  +-------------------+  +-------------------+                      |
 |  | API Server        |  | Cost Engine       |                      |
-|  | - gRPC (internal) |  | - Rate card mgmt  |                      |
-|  | - REST (external) |  | - Billing recon   |                      |
-|  | - GraphQL (UI)    |  | - Cost allocation |                      |
+|  | - REST/JSON       |  | - Rate card mgmt  |                      |
+|  |   (/api/v1/*)     |  | - Billing recon   |                      |
+|  | - serves the UI   |  | - Cost allocation |                      |
 |  +-------------------+  +-------------------+                      |
 |                                                                    |
 |  +-------------------+  +-------------------+                      |
@@ -649,36 +666,25 @@ Prometheus is still used at the node level for real-time metrics and alerting vi
 
 ### 7.2 API Design
 
+The API is **REST/JSON under `/api/v1/*`** (`pkg/api`). There is no gRPC or GraphQL layer — a dead gRPC contract (`proto/`) that earlier revisions described was removed per [DEC-017](decisions/DEC-017-remove-dead-proto-and-honest-cost-export.md) (no generated code, no importers).
+
+Every route is declared in one table (`pkg/api/routes.go`) that carries, per route: the RBAC action required for reads and writes, a *mutating* marker, and the license feature flag that gates it (DEC-020). `buildMux` walks the table to register handlers; the RBAC and license tests walk the same table, so a route cannot be added without declaring its enforcement. The surface, by area:
+
 ```
-gRPC Services:
-  FlowService:
-    - QueryFlows(timerange, filters) -> FlowStream
-    - GetTopTalkers(timerange, groupBy) -> TopTalkers
-
-  CostService:
-    - GetCostBreakdown(timerange, groupBy, filters) -> CostBreakdown
-    - GetCostTrend(timerange, granularity) -> TimeSeries
-    - GetReconciliationReport(month) -> ReconciliationReport
-
-  AlertService:
-    - ListAlerts(filters) -> AlertList
-    - CreateAlertRule(rule) -> AlertRule
-    - AcknowledgeAlert(id) -> Ack
-
-  RecommendationService:
-    - GetRecommendations(scope) -> RecommendationList
-    - GetSavingsEstimate(recommendation_id) -> SavingsEstimate
-
-  ClusterService:
-    - RegisterCluster(cluster) -> ClusterRegistration
-    - ListClusters() -> ClusterList
-    - GetClusterHealth(id) -> HealthStatus
-
-  ConfigService:
-    - GetAgentConfig(cluster, node) -> AgentConfig
-    - UpdateAgentConfig(cluster, config) -> Ack
-
-REST/GraphQL: Thin layer over gRPC for dashboard consumption.
+Cost & flows:      /api/v1/costs*, /api/v1/flows*, top-talkers, trends
+Reconciliation:    /api/v1/reconcile            (finops role; "reconciliation" feature)
+What-if / CI gate: /api/v1/whatif, /api/v1/cicd/* ("whatif" feature) — fed from live
+                   costed flow batches; answers 503 until data has been ingested,
+                   never a fake $0 delta
+Alerts/anomalies:  /api/v1/alerts*, /api/v1/anomalies ("anomaly" feature)
+Recommendations:   /api/v1/recommendations* et al. ("recommendations" feature)
+Remediation:       /api/v1/remediations*, /api/v1/autoremediate/*
+                   ("remediation" feature; the autoremediation policy write is
+                   admin-only — the P8 approval gate)
+Multi-cluster:     /api/v1/clusters* ("multicluster" feature; community cap = 1
+                   cluster, enforced at registration)
+Audit:             /api/v1/audit* ("audit-log" feature; entries are recorded
+                   regardless of license)
 ```
 
 ### 7.3 Inter-Component Communication
@@ -690,6 +696,8 @@ REST/GraphQL: Thin layer over gRPC for dashboard consumption.
 - Subjects: `tollwing.config.{cluster}` -- config distribution
 - JetStream provides at-least-once delivery, replay, and consumer groups
 - Agents publish; control plane services consume
+- Subject tokens are validated at publisher construction and the agent resolves its cluster/node identity before the first publish ([DEC-019](decisions/DEC-019-cluster-identity-fail-fast-nats-subject.md)) — an empty `-cluster` used to build `tollwing.flows..{node}` and silently drop every batch
+- The subscriber `Term`s poison messages, `Nak`s transient failures with exponential backoff, and caps redelivery (`MaxDeliver=5`) — dropped data is logged, never hot-looped (DEC-020)
 
 Why NATS over Kafka: Lower operational complexity, single binary, built-in clustering, sufficient throughput (millions of messages/sec), and NATS is already popular in the cloud-native ecosystem.
 
@@ -777,12 +785,7 @@ Recommendation Categories:
 
 ### 9.1 Technology Choice
 
-**React + TypeScript frontend, served by the API server.** This is a standard choice that enables:
-- Rich interactive visualizations (D3.js or Recharts for Sankey diagrams)
-- Real-time updates via WebSocket subscription
-- Embeddable panels for Grafana (via iframe or Grafana plugin)
-
-Alternatively, ship a full Grafana plugin for teams that prefer Grafana-native. The ClickHouse datasource plugin already exists.
+**React + TypeScript frontend (`ui/`, Vite + Recharts), served by the API server** (Enterprise). This is a standard choice that enables rich interactive visualizations over the REST API. Real-time WebSocket updates and embeddable Grafana panels are **(roadmap)**; the free tier's dashboard story is the 23-panel Grafana dashboard over your own Prometheus (§13.1).
 
 ### 9.2 Key Views
 
@@ -870,31 +873,16 @@ Kubernetes Deployment:
 
 ### 10.2 Helm Chart Structure
 
+Three charts under `deploy/helm/`, split along the open-core boundary (§13):
+
 ```
-tollwing/
-  Chart.yaml
-  values.yaml
-  templates/
-    agent/
-      daemonset.yaml
-      serviceaccount.yaml
-      clusterrole.yaml        # RBAC for node, pod, service, endpoint watching
-      clusterrolebinding.yaml
-      configmap.yaml           # agent config
-    server/
-      deployment.yaml
-      service.yaml
-      ingress.yaml
-      configmap.yaml
-      secret.yaml              # cloud credentials
-    storage/
-      clickhouse-statefulset.yaml  (optional, can use external)
-      nats-statefulset.yaml        (optional, can use external)
-    crds/
-      costpolicy-crd.yaml     # CRD for cost policies / budgets
-      alertrule-crd.yaml      # CRD for alert rules
-    operator/                  # Optional: Kubernetes operator
-      controller-deployment.yaml
+deploy/helm/
+  tollwing-agent/        # the free agent DaemonSet (published):
+                         #   daemonset, serviceaccount, clusterrole(+binding),
+                         #   configmap, optional cost-export sidecar
+  tollwing-server/       # the Enterprise control plane:
+                         #   server deployment/service, storage wiring
+  tollwing-scheduler/    # Enterprise scheduler integration
 ```
 
 ### 10.3 Operator Pattern (Phase 2)
@@ -922,16 +910,11 @@ spec:
 ### 10.4 Non-Kubernetes Deployment
 
 For VMs and bare metal:
-- **Systemd unit:** `tollwing-agent.service`
-- **Package:** .deb and .rpm packages via GoReleaser (same pattern as our reference eBPF agent's `.github/workflows/release.yaml`)
-- **Config:** YAML file at `/etc/tollwing/agent.yaml`
+- **Systemd unit:** `tollwing-agent.service` + `agent.yaml` config (`deploy/systemd/`)
 - Metadata enrichment falls back to: IMDS for cloud metadata, `/proc` for process info, no pod/service context
-- Registration with control plane via agent bootstrap token
+- .deb/.rpm packaging (GoReleaser) and control-plane registration via bootstrap token are **(roadmap)**
 
-For serverless:
-- **AWS Lambda:** Lambda Layer containing the agent binary, invoked as extension
-- **GCP Cloud Functions:** Similar layer/sidecar approach
-- Limited eBPF support in serverless; fall back to VPC Flow Logs ingestion
+Serverless (Lambda/Cloud Functions extension agents, VPC Flow Logs fallback) is **(roadmap)** — nothing ships for it today.
 
 ---
 
@@ -940,42 +923,46 @@ For serverless:
 ### 11.1 Cloud Abstraction Layer
 
 ```go
-// CloudProvider abstracts cloud-specific operations
-type CloudProvider interface {
+// Provider abstracts cloud-specific operations (pkg/cloud/provider.go).
+type Provider interface {
     // Identity
-    GetRegion() string
-    GetZone() string
-    GetAccountID() string
+    Name() string  // "aws", "gcp", "azure"
+    Region() string
+    Zone() string
+    AccountID(ctx context.Context) (string, error)
 
     // Network Topology
-    GetSubnetZoneMapping() (map[string]string, error)  // CIDR -> zone
-    GetNATGateways() ([]NATGateway, error)
-    GetVPCPeerings() ([]VPCPeering, error)
-    GetTransitGateways() ([]TransitGateway, error)
-    GetServiceCIDRs() (map[string][]string, error)  // service name -> CIDRs
+    GetSubnetZoneMapping(ctx context.Context) (map[netip.Prefix]string, error)
+    GetNATGateways(ctx context.Context) ([]NATGateway, error)
+    GetVPCPeerings(ctx context.Context) ([]VPCPeering, error)
+    GetTransitGateways(ctx context.Context) ([]TransitGateway, error)
+    GetServiceCIDRs(ctx context.Context) (map[string][]netip.Prefix, error)
 
     // Pricing
-    GetRateCard(region string) (*RateCard, error)
-    GetCommittedUsePricing() (*CommittedPricing, error)
+    GetRateCard(ctx context.Context, region string) (*cost.RateCard, error)
 
     // Billing
-    GetBillingData(start, end time.Time) (*BillingData, error)
+    GetBillingData(ctx context.Context, start, end time.Time) (*cost.BillingData, error)
 }
 ```
 
+Route-based NAT detection (§4.3) is an *optional* interface (`natRouteDetector`, implemented by AWS today), so providers gain no new required method (P11).
+
 ### 11.2 Provider-Specific Differences
+
+Rates below are the defaults verified against provider pricing pages on **2026-07-02** ([DEC-014](decisions/DEC-014-metered-directions-and-marginal-default-pricing.md) has the full table with sources); which *direction* of a flow is billable differs per provider and is carried on the rate card (`Directions`):
 
 | Feature | AWS | GCP | Azure |
 |---------|-----|-----|-------|
-| Cross-AZ pricing | $0.01/GB each way | Free (intra-region) | $0.01/GB each way |
-| Internet egress | Tiered: $0.09-$0.05/GB | Tiered: $0.085-$0.05/GB | Tiered: $0.087-$0.05/GB |
-| NAT Gateway | $0.045/hr + $0.045/GB | Cloud NAT: $0.045/GB | NAT Gateway: $0.045/hr + per GB |
-| VPC Peering | Free same-region, $0.01/GB cross-region | Free same-region | Free same-region, per-GB cross |
-| Zone metadata | IMDS v2 | Metadata server | IMDS |
+| Cross-AZ pricing | $0.01/GB **each direction** | $0.01/GiB, billed to the sender | **Free** (inter-AZ charges retired 2024) |
+| Internet egress | 100 GB/mo free, then tiered $0.09→$0.05/GB | Tiered $0.12→$0.08/GiB (Premium) | 100 GB/mo free, then tiered $0.087→$0.05/GB |
+| NAT Gateway | $0.045/hr + $0.045/GB | Cloud NAT: per-VM-hr + $0.045/GiB | NAT Gateway: $0.045/hr + $0.045/GB |
+| VPC Peering | $0.01/GB each direction cross-AZ (free same-AZ, but the peer's AZ is unobservable — priced conservatively at the cross-AZ rate) | Standard inter-zone rates | VNet peering: $0.01/GB in **and** out |
+| Zone metadata | IMDS v2 | Metadata server | IMDS (region-qualified ordinals, §4.2) |
 | Billing source | CUR (S3 Parquet) | BigQuery export | Cost Management API |
-| Service CIDRs | `ip-ranges.json` | Published ranges | Service Tags |
+| Metered direction (default table) | cross-AZ/peering/endpoint/NAT: Tx+Rx; egress/cross-region/TGW: Tx | Sender-side (Tx); PSC/NAT per-GB: Tx+Rx | Cross-AZ: none; egress/inter-region: Tx; peering/Private Link: Tx+Rx |
 
-The classifier's decision tree has provider-specific branches. On GCP, cross-AZ within a region is free, so the classifier only cares about cross-region. On AWS/Azure, cross-AZ is significant cost.
+The classifier's decision tree has provider-specific *pricing*, not provider-specific branches: on Azure a cross-AZ classification prices at $0, and on GCP the sender side pays — the classification itself stays honest everywhere (a GCP flow without per-IP zone data is `Unknown`, §4.2).
 
 ---
 
@@ -994,12 +981,14 @@ The classifier's decision tree has provider-specific branches. On GCP, cross-AZ 
 ### 12.2 RBAC Model
 
 ```
-Roles:
-  viewer:      Read dashboards, view costs
-  team-lead:   Above + view own namespace costs, set budgets
-  finops:      Above + view all namespaces, billing reconciliation
-  admin:       Above + manage agent config, alert rules, cloud credentials
-  super-admin: Above + multi-cluster management
+Roles (pkg/auth/rbac.go; optionally namespace-scoped):
+  viewer:    Read cost data, dashboards, recommendations
+  approver:  Above + remediation approve/reject/apply (write_deploy)
+  finops:    Above + billing reconciliation (read_billing — billing data is
+             classified High in §12.1 and is not a viewer read)
+  admin:     Every action, including manage_policy — the only role that can
+             write the autonomous-remediation policy (the P8 approval gate,
+             DEC-020)
 
 Kubernetes RBAC:
   Agent ServiceAccount:
@@ -1012,6 +1001,8 @@ Kubernetes RBAC:
     - create/update: CostPolicy and AlertRule CRDs
     - get: secrets (for cloud credentials, namespaced)
 ```
+
+API-surface hardening (DEC-020): handlers return generic 500s with details in `slog` (no driver/SQL internals on the wire, P12); one trusted-proxy-aware client-IP derivation (`-trust-xff`, `-trusted-proxies`, rightmost-entry semantics) feeds both the rate limiter and the audit log; the tamper-evident audit ring is signed (`-audit-signing-key`, else an ephemeral per-process key) and verified from its eviction watermark, so a wrapped ring does not raise a false SOC2 incident.
 
 ### 12.3 Agent Security Hardening
 
@@ -1032,127 +1023,89 @@ Kubernetes RBAC:
 
 ## 13. OPEN SOURCE VS. COMMERCIAL SPLIT
 
+**The authoritative statement of this boundary is [`OPEN-CORE.md`](OPEN-CORE.md)** (adopted per [DEC-013](decisions/DEC-013-open-core-repo-split-allow-list-boundary.md)); if this section and that document ever disagree, `OPEN-CORE.md` governs. Summary:
+
 ### 13.1 Open Source (Apache 2.0)
 
-Core functionality that establishes the project and builds community:
+Everything in the public repository ([github.com/tollwing/tollwing](https://github.com/tollwing/tollwing)) is Apache-2.0 and runs standalone — no license key, no phone-home, no control-plane server required:
 
-- eBPF agent with all hooks (sock_ops, cgroup/connect, kprobes)
-- Connection tracking with process-level attribution
-- Traffic classification (same-zone, cross-AZ, cross-region, internet)
-- ClusterIP / pre-DNAT resolution
-- Prometheus metrics export
-- Local node dashboard
-- Single-cluster mode
-- CLI tool for ad-hoc queries
-- AWS support (most popular cloud)
-- Helm chart for single-cluster deployment
-- Basic alerting (threshold-based)
+- The eBPF agent (`tollwing-agent`), in full: the 9-way per-pod classifier, the eBPF data plane (with the BPF sources and vendored build inputs to compile them yourself), pre-DNAT intent capture and service-graph attribution, and list-price cost math (measured bytes × dated rate card, P4)
+- Output you already own: `tollwing_*` Prometheus metrics on `:9990/metrics`, the 23-panel Grafana dashboard, and the FOCUS-aligned JSON cost-export sidecar (`opencost-plugin/`)
+- `tollwing-terraform` — the standalone Terraform network-cost estimator
+- The pure-Go proof suite (`test/sim/`, `make demo`) and the agent Helm chart
+- The governance system: `CONSTITUTION.md`, the public decision log, `docs/governance/`, `tools/governance`
 
-### 13.2 Commercial (License: BSL or proprietary)
+Scope of the free tier: **single cluster, AWS**, with retention set by your own Prometheus. It is the complete live per-pod view — not a trial or a teaser build. Per OPEN-CORE.md, **accuracy and honesty fixes are always free** (P4/P5), and nothing that has shipped free ever moves behind the license (the no-rug-pull commitment).
 
-Advanced features requiring significant ongoing investment:
+### 13.2 Commercial (Tollwing Enterprise — offline signed license)
 
-- **Multi-cluster management:** Central control plane, fleet-wide views
-- **Billing reconciliation:** Cloud billing API integration, drift analysis
-- **Advanced recommendations:** Automated topology optimization, what-if analysis
-- **Anomaly detection:** ML-based anomaly detection (not just threshold)
-- **Multi-cloud:** GCP and Azure provider support
-- **SSO/SAML:** Enterprise authentication
-- **Role-based dashboards:** Custom views per team/namespace
-- **SLA reporting:** Uptime, accuracy guarantees
-- **Dedicated support:** Engineering support channel
-- **Long-term storage:** Managed ClickHouse, S3-tiered cold storage
-- **Compliance:** SOC2, audit logging
+The self-hosted control plane built on the same agent, licensed with an offline signed license (no phone-home, air-gappable; DEC-012). Its source lives in the private monorepo and is not published:
 
-### 13.3 Monetization Strategy
+- **The control-plane server (`tollwing-server`):** long-term history (ClickHouse), the REST API, the CLI (`tollwing-cli`), the Cost Savings Report
+- **Multi-cluster aggregation:** fleet-wide views across clusters
+- **CUR reconciliation:** your *actual discounted* rates, drift and accuracy scoring
+- **Acting on the data:** alerts, anomaly detection, recommendations, what-if analysis, approval-gated auto-remediation (P8)
+- **GCP and Azure** provider support
+- **Organizational features:** SSO/RBAC, multi-tenancy, HA, the operator, integrations (Slack, MCP, CI/CD, admission webhook)
 
-- Open core model: free agent, paid control plane
-- Cloud-hosted SaaS option (agents ship data to managed backend)
-- On-premise enterprise license
-- Pricing: per-node/month for the agent fleet
+These are enforced as license *features* at the API route table (`"multicluster"`, `"reconciliation"`, `"whatif"`, `"anomaly"`, `"remediation"`, `"recommendations"`, `"audit-log"` — §7.2, DEC-020).
+
+### 13.3 Commercial Model
+
+- Open core: free agent, paid self-hosted control plane
+- **Not a hosted service:** there is no SaaS offering; agents never ship data to a Tollwing-operated backend. The free tier does not depend on the company existing
+- On-premise Enterprise license (offline Ed25519-signed, DEC-012); unlicensed or expired deployments degrade to community features and caps
+- The dividing line tracks P1: the agent measures; state, history, cross-cluster correlation, and actions live in the control plane — and the control plane is the commercial product
 
 ---
 
 ## 14. PROJECT STRUCTURE
 
+Binaries are thin `cmd/<name>/main.go` wrappers; the work lives in flat `pkg/<concern>` packages. Abridged to the load-bearing paths:
+
 ```
 tollwing/
 ├── cmd/
-│   ├── agent/              # DaemonSet agent binary
-│   │   └── main.go
-│   ├── server/             # Control plane server binary
-│   │   └── main.go
-│   └── cli/                # CLI tool (tollwingctl)
-│       └── main.go
+│   ├── tollwing-agent/       # DaemonSet agent binary (Linux + eBPF)
+│   ├── tollwing-terraform/   # standalone Terraform network-cost estimator
+│   ├── tollwing-server/      # control plane (Enterprise)
+│   ├── tollwing-cli/         # CLI (Enterprise)
+│   └── tollwing-{license,mcp,slack,admission}/   # Enterprise tooling/integrations
 ├── pkg/
-│   ├── ebpf/               # eBPF program management (mirrors our reference eBPF agent/pkg/ebpf)
-│   │   ├── bpf/
-│   │   │   ├── sockops.bpf.c
-│   │   │   ├── connect.bpf.c    # cgroup/connect4 for pre-DNAT
-│   │   │   ├── tcpcount.bpf.c   # kprobe tcp_sendmsg/cleanup_rbuf
-│   │   │   ├── conntrack.bpf.c  # fentry nf_conntrack (optional)
-│   │   │   ├── maps.h
-│   │   │   ├── common.h
-│   │   │   └── Makefile
-│   │   ├── loader.go
-│   │   ├── features.go
-│   │   ├── poller.go        # map batch reader
-│   │   └── types.go
-│   ├── enricher/            # Metadata enrichment
-│   │   ├── process.go       # PID -> process info from /proc
-│   │   ├── container.go     # container ID -> container runtime
-│   │   ├── kubernetes.go    # K8s informer-based enrichment
-│   │   ├── zone.go          # IP -> zone resolution
-│   │   └── service.go       # endpoint -> service mapping
-│   ├── classifier/          # Traffic classification
-│   │   ├── classifier.go    # Main classification engine
-│   │   ├── cidr.go          # CIDR-based lookup tables
-│   │   ├── nat.go           # NAT gateway detection
-│   │   └── types.go
-│   ├── cost/                # Cost calculation
-│   │   ├── engine.go
-│   │   ├── ratecard.go
-│   │   ├── tiered.go
-│   │   └── reconcile.go
-│   ├── cloud/               # Cloud provider abstraction
-│   │   ├── provider.go      # Interface
-│   │   ├── aws/
-│   │   ├── gcp/
-│   │   └── azure/
-│   ├── storage/             # Storage layer
-│   │   ├── clickhouse/
-│   │   └── prometheus/
-│   ├── alert/               # Alert engine
-│   │   ├── engine.go
-│   │   ├── anomaly.go
-│   │   └── notify/
-│   ├── recommend/           # Recommendation engine
-│   │   ├── topology.go
-│   │   ├── endpoint.go
-│   │   └── natgw.go
-│   ├── api/                 # gRPC + REST API
-│   │   ├── grpc/
-│   │   ├── rest/
-│   │   └── graphql/
-│   └── agent/               # Agent orchestration
-│       ├── agent.go         # Main agent lifecycle (like our reference eBPF agent's engine.Engine)
-│       └── config.go
-├── proto/                   # Protobuf definitions
-│   ├── flow.proto
-│   ├── cost.proto
-│   └── alert.proto
-├── deploy/
-│   ├── helm/
-│   │   └── tollwing/
-│   ├── systemd/
-│   └── lambda/
-├── ui/                      # React dashboard
-├── vmlinux/                 # vmlinux headers (same as our reference eBPF agent)
-├── include/                 # BPF helper headers (same as our reference eBPF agent)
+│   ├── ebpf/                 # BPF loading, feature probes, map access
+│   │   └── bpf/              # tollwing.bpf.c, quic.bpf.c, dns.bpf.c,
+│   │                         # maps.h, Makefile (CO-RE, clang)
+│   ├── poller/               # map drains (batch LookupAndDelete), QUIC dedup
+│   ├── exporter/             # Prometheus /metrics endpoint
+│   ├── agent/                # agent orchestration: config, lifecycle, shutdown order
+│   ├── intent/               # two-phase pre-DNAT correlation (DEC-003)
+│   ├── classifier/           # TrafficType (canonical enum) + decision tree (§4)
+│   ├── cost/                 # rate cards, engine, pricing modes, reconcile
+│   ├── cloud/                # Provider interface + aws/ gcp/ azure/
+│   ├── k8s/                  # informers: pods, services, EndpointSlices, cluster UID
+│   ├── dns/                  # DNS answer cache for destination enrichment
+│   ├── nats/                 # JetStream publisher/subscriber
+│   ├── api/                  # REST/JSON control-plane API (Enterprise; route table §7.2)
+│   ├── auth/                 # OIDC + RBAC (Enterprise)
+│   ├── storage/clickhouse/   # warm/cold store (Enterprise, DEC-004)
+│   └── …                     # further Enterprise control-plane packages
+│                             # (alert, anomaly, recommend, whatif, license, …)
+│                             # live only in the private monorepo (§13)
+├── opencost-plugin/          # FOCUS-aligned JSON cost-export sidecar (DEC-017)
+├── test/sim/                 # pure-Go proof suite + demo (DEC-008)
+├── tools/governance/         # index / scan / audit (stdlib-only)
+├── decisions/                # ADRs + generated index
+├── docs/governance/          # conventions, compatibility, audit playbook
+├── deploy/                   # helm/ (tollwing-agent, …), systemd/, kubernetes/, …
+├── ui/                       # React dashboard (Enterprise, served by the server)
+├── vmlinux/                  # generated kernel BTF headers (vendored)
+├── include/                  # BPF helper headers (vendored)
 ├── Makefile
 ├── go.mod
 └── go.sum
 ```
+
+There is no `proto/` directory: the API is REST/JSON, and the dead gRPC contract that used to live there was removed per [DEC-017](decisions/DEC-017-remove-dead-proto-and-honest-cost-export.md).
 
 ---
 
@@ -1174,20 +1127,22 @@ tollwing/
 
 | System | Integration Method | Direction |
 |--------|-------------------|-----------|
-| Prometheus | Remote write + scrape endpoint | Export |
-| Grafana | ClickHouse datasource + optional plugin | Query |
-| Datadog | DogStatsD metrics + custom check | Export |
-| Slack | Webhook | Alerts |
-| PagerDuty | Events API v2 | Alerts |
-| OpsGenie | API | Alerts |
-| Terraform | Provider for CostPolicy CRDs | Config |
-| Kubecost | Import existing Kubecost data for migration | Import |
-| OpenCost | Compatible Prometheus metrics | Export |
-| OTLP/OpenTelemetry | OTLP exporter for traces/metrics | Export |
+| Prometheus | Scrape endpoint (`:9990/metrics`, free tier) | Export |
+| Grafana | 23-panel dashboard over your Prometheus (free); ClickHouse datasource for the Enterprise store | Query |
+| External cost tooling | FOCUS-aligned JSON cost-export sidecar (`opencost-plugin/`, [DEC-017](decisions/DEC-017-remove-dead-proto-and-honest-cost-export.md)) — **not** an OpenCost plugin | Export |
+| OpenCost | Differential harness (`test/sim/differential`) deploys real OpenCost to *compare against* — it demonstrates the attribution gap, it does not feed OpenCost | Testing |
+| Datadog / Splunk | Async event exporters (`pkg/integrations`, Enterprise) | Export |
+| Slack | Bot + webhooks (`cmd/tollwing-slack`, Enterprise) | Alerts |
+| PagerDuty / OpsGenie / Alertmanager | Alert notifiers (`pkg/alert/notify.go`, Enterprise) | Alerts |
+| MCP | `cmd/tollwing-mcp` (Enterprise) | Query |
+| CI/CD | Cost gate (`/api/v1/cicd/evaluate`, Enterprise) — 503 until real flow data has been ingested, never a $0 verdict from empty matrices | Gate |
+| Admission webhook | `cmd/tollwing-admission` (Enterprise) | Gate |
+| Terraform | `tollwing-terraform` estimates a plan's network cost from the same rate cards (free) | Estimate |
+| Kubecost data import, OTLP metric export | **(roadmap)** | Import/Export |
 
 ---
 
-This architecture addresses all six gaps identified in the market research: process-level attribution (via PID capture in BPF hooks), accurate cross-AZ classification (via the cgroup/connect4 pre-DNAT technique), eBPF + billing reconciliation (via CUR/BigQuery integration), connection-level cost attribution (via socket cookie keyed maps), real-time alerting (via streaming anomaly detection), and non-Kubernetes support (via systemd/Lambda deployment paths).
+This architecture addresses the gaps identified in the market research: process-level attribution (via PID capture in BPF hooks), accurate cross-AZ classification (via the cgroup/connect4 pre-DNAT technique), eBPF + billing reconciliation (via CUR/BigQuery integration, Enterprise), connection-level cost attribution (via socket cookie keyed maps), and real-time alerting (via streaming anomaly detection, Enterprise). Non-Kubernetes support beyond the systemd unit is roadmap (§10.4).
 
 The critical technical innovation is the two-phase capture using `cgroup/connect4` (pre-DNAT) + `sock_ops` (post-DNAT) to solve the ClusterIP problem that Kubecost cannot solve. This, combined with in-kernel aggregation via PERCPU_HASH maps, keeps overhead under 1% while providing connection-level granularity.
 

@@ -1,0 +1,22 @@
+# gitleaks-config.toml — Tollwing's gitleaks config (Per DEC-018).
+#
+# Extends the DEFAULT ruleset (never replaces it: useDefault must stay true)
+# with a tightly-scoped allowlist of known TEST FIXTURES that trip generic
+# rules. An entry here must be the exact fixture literal — never a broad
+# pattern — so it cannot mask a real credential.
+#
+# Used by: the assemble-time gate in publish-oss.sh (copied to the OSS tree as
+# .gitleaks.toml, where the public CI auto-detects it) and the private CI
+# secrets job (--config).
+#
+# PREFER an inline "gitleaks:allow" comment on the offending line when you own
+# the file; add an entry here only for files another workstream owns.
+title = "tollwing gitleaks"
+
+[extend]
+useDefault = true
+
+# No global allowlist entries: known test fixtures carry inline
+# "gitleaks:allow" comments at the source instead (preferred, see header).
+# NOTE: gitleaks rejects an EMPTY [allowlist] section — if you need one
+# again, it must contain at least one regex/path/commit entry.

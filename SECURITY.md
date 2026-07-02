@@ -6,7 +6,8 @@ Tollwing runs a privileged eBPF agent on every node and handles sensitive cost a
 
 Please report security issues **privately**, not via public GitHub issues:
 
-- Email **security@tollwing.com** with subject `Tollwing security: <short title>`.
+- Preferred: **GitHub private vulnerability reporting** — [Security → "Report a vulnerability"](https://github.com/tollwing/tollwing/security/advisories/new) on the public repo.
+- Or email **security@tollwing.com** with subject `Tollwing security: <short title>`.
 - Include affected component/version, reproduction steps, and impact.
 - We aim to acknowledge within 3 business days and to coordinate a fix and disclosure timeline with you.
 
@@ -39,4 +40,4 @@ The agent is privileged by necessity (it loads eBPF), so it is scoped tightly:
 
 ## Scope
 
-This policy covers the Tollwing agent, control-plane server, CLI, and the governance tooling in this repository. Issues in third-party dependencies (e.g. `cilium/ebpf`, `clickhouse-go`, cloud SDKs) should also be reported to their upstreams.
+This policy covers the open-source Tollwing agent and tooling, and also the Tollwing Enterprise components (control-plane server, CLI), whose source lives in the private monorepo (see [`OPEN-CORE.md`](OPEN-CORE.md)) — report Enterprise issues through the same channels. Issues in third-party dependencies (e.g. `cilium/ebpf`, `clickhouse-go`, cloud SDKs) should also be reported to their upstreams.

@@ -71,7 +71,12 @@ func (c *PricingClient) FetchRateCard(ctx context.Context, region string) (*cost
 		applyAWSNATGatewayPrices(card, natItems)
 	}
 
+	// Live prices: re-date and re-label the card (P4 — every rate is dated
+	// and sourced; the default card's date covers only the defaults it
+	// started from).
 	card.LastUpdated = time.Now()
+	card.Source = "aws-price-list-api"
+	card.Fallback = false
 	return card, nil
 }
 

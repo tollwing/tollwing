@@ -10,6 +10,31 @@
 // Accumulates bytes per flow in the quic_flows PERCPU_HASH map.
 //
 // Attachment: TCX (kernel 6.6+) or legacy tc filter (fallback).
+//
+// Authoritative-source rule (P5 — attribute each byte exactly once):
+// UDP TX bytes have exactly one owner per agent run, chosen kernel-side so
+// the two sources are disjoint BY CONSTRUCTION rather than deduplicated by
+// heuristic in the poller:
+//
+//   - agent_config.udp_socket_tx == 1 (-udp is on AND fentry/udp_sendmsg
+//     attached): the socket path — cgroup/connect4 `connections` entries
+//     fed by fentry/udp_sendmsg — owns UDP TX with PID/cgroup attribution,
+//     and this program records NOTHING. Known, accepted limitation: egress
+//     on UNCONNECTED UDP sockets (plain sendto, e.g. a QUIC server's
+//     responses) never gets a `connections` entry and is therefore
+//     uncounted in this mode — a documented undercount, preferred over the
+//     double count that any userspace join produced (the socket path keys
+//     on the pre-DNAT connect() destination while this hook sees the
+//     post-DNAT wire destination, so DNATed QUIC defeated the dedup; and a
+//     destination-keyed seen-set discarded other pods' bytes to shared
+//     destinations).
+//
+//   - agent_config.udp_socket_tx == 0: quic_flows is the sole UDP TX
+//     source (no `connections` entry ever accumulates UDP TX bytes: either
+//     track_udp is off, so cgroup/connect4 creates no UDP entries, or
+//     fentry/udp_sendmsg is not attached, so nothing feeds them).
+//
+// The poller (pkg/poller) therefore merges quic_flows without any dedup.
 
 // Included from tollwing.bpf.c — do not compile standalone.
 // vmlinux.h, bpf helpers, and maps.h are already included.
@@ -73,6 +98,16 @@ static __always_inline int detect_quic(__u8 first_byte)
 SEC("tc")
 int tollwing_quic_egress(struct __sk_buff *skb)
 {
+	// Bail out when capture is disabled (consistent with every other
+	// recording hook) or when the socket-level UDP path owns UDP TX bytes —
+	// see the authoritative-source rule in the header comment. Skipping
+	// here, kernel-side, is what makes quic_flows and flow_aggregates
+	// provably disjoint for UDP; the poller relies on it to merge without
+	// dedup.
+	struct agent_config *cfg = get_config();
+	if (!cfg || cfg->udp_socket_tx)
+		return TC_ACT_OK;
+
 	void *data     = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
@@ -191,7 +226,10 @@ int tollwing_quic_egress(struct __sk_buff *skb)
 		new_val.last_seen_ns = now;
 		new_val.quic_version = quic_version;
 		new_val.is_long_header = (header_type == 1) ? 1 : 0;
-		bpf_map_update_elem(&quic_flows, &key, &new_val, BPF_NOEXIST);
+		// Map full (or lost insert race) — the packet's bytes are gone;
+		// count it so the drop metrics tell the truth (P4).
+		if (bpf_map_update_elem(&quic_flows, &key, &new_val, BPF_NOEXIST))
+			count_drop(DROP_SLOT_QUIC_FLOWS);
 	}
 
 	return TC_ACT_OK;

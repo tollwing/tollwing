@@ -3,11 +3,15 @@
 package ebpf
 
 import (
+	"errors"
 	"fmt"
+	"sync"
+	"syscall"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/features"
+	"github.com/cilium/ebpf/link"
 )
 
 // ProbeResult describes the availability of a specific eBPF feature.
@@ -37,9 +41,7 @@ func ProbeAll() (required []ProbeResult, optional []ProbeResult) {
 		probeHelper("get_socket_cookie (kprobe)", ebpf.Kprobe, asm.FnGetSocketCookie),
 		probeProgramType("tracing (fentry/fexit)", ebpf.Tracing),
 		probeHelper("get_func_ip (tracing)", ebpf.Tracing, asm.FnGetFuncIp),
-		probeCgroupStorage(),
 		probeSkStorage(),
-		probeNetfilterProg(),
 		probeTCX(),
 	}
 	return
@@ -96,15 +98,10 @@ func probeHelper(name string, pt ebpf.ProgramType, fn asm.BuiltinFunc) ProbeResu
 	return ProbeResult{Name: name, Supported: err == nil, Err: err}
 }
 
-// HaveCgroupStorage probes for BPF_MAP_TYPE_CGRP_STORAGE (kernel 6.3+).
-func HaveCgroupStorageMap() bool {
-	return features.HaveMapType(ebpf.CGroupStorage) == nil
-}
-
-func probeCgroupStorage() ProbeResult {
-	err := features.HaveMapType(ebpf.CGroupStorage)
-	return ProbeResult{Name: "cgrp_storage (6.3+)", Supported: err == nil, Err: err}
-}
+// Per DEC-016, HaveCgroupStorageMap was removed with the CGRP_STORAGE
+// subsystem. It also probed the wrong map type: ebpf.CGroupStorage is
+// BPF_MAP_TYPE_CGROUP_STORAGE (type 19, kernel 4.19), not
+// BPF_MAP_TYPE_CGRP_STORAGE (type 32, kernel 6.3).
 
 // HaveSkStorage probes for BPF_MAP_TYPE_SK_STORAGE.
 func HaveSkStorage() bool {
@@ -116,32 +113,50 @@ func probeSkStorage() ProbeResult {
 	return ProbeResult{Name: "sk_storage", Supported: err == nil, Err: err}
 }
 
-// HaveNetfilterProg probes for BPF_PROG_TYPE_NETFILTER (kernel 6.4+).
-func HaveNetfilterProg() bool {
-	// BPF_PROG_TYPE_NETFILTER = 37
-	return features.HaveProgramType(ebpf.ProgramType(37)) == nil
-}
-
-func probeNetfilterProg() ProbeResult {
-	err := features.HaveProgramType(ebpf.ProgramType(37))
-	return ProbeResult{Name: "netfilter prog (6.4+)", Supported: err == nil, Err: err}
-}
-
-// HaveTCX probes for TCX program attachment (kernel 6.6+).
-// TCX uses BPF_LINK_TYPE_TCX which can be detected by checking for
-// the SchedCLS program type (it's the same prog type, different attach).
+// HaveTCX reports whether the kernel supports TCX link attachment (6.6+).
+//
+// Probing SchedCLS alone is NOT evidence of TCX: that program type exists
+// since kernel 4.1, so the old probe reported "TCX supported" everywhere and
+// the QUIC attach then failed at runtime on <6.6 kernels. Instead, attempt a
+// real TCX link create against an interface index that cannot exist: a
+// TCX-capable kernel parses the link type and fails looking up the device
+// (ENODEV), while a pre-6.6 kernel rejects the link/attach type itself.
 func HaveTCX() bool {
-	// TCX requires kernel 6.6+. We probe by checking if the kernel
-	// supports SchedCLS with link-based attachment.
-	return features.HaveProgramType(ebpf.SchedCLS) == nil
+	return haveTCX()
 }
+
+var haveTCX = sync.OnceValue(func() bool {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type:    ebpf.SchedCLS,
+		License: "MIT",
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+	})
+	if err != nil {
+		return false
+	}
+	defer prog.Close()
+
+	lnk, err := link.AttachTCX(link.TCXOptions{
+		Program:   prog,
+		Attach:    ebpf.AttachTCXEgress,
+		Interface: int(^uint32(0)), // deliberately nonexistent ifindex
+	})
+	if err == nil {
+		// Cannot happen with a bogus ifindex; be safe anyway.
+		lnk.Close()
+		return true
+	}
+	return errors.Is(err, syscall.ENODEV)
+})
 
 func probeTCX() ProbeResult {
-	err := features.HaveProgramType(ebpf.SchedCLS)
-	return ProbeResult{Name: "tc/tcx (6.6+)", Supported: err == nil, Err: err}
-}
-
-// HaveIterator probes for BPF iterator support.
-func HaveIterator() bool {
-	return features.HaveProgramType(ebpf.Tracing) == nil
+	supported := HaveTCX()
+	var err error
+	if !supported {
+		err = errors.New("TCX link create not supported")
+	}
+	return ProbeResult{Name: "tcx link (6.6+)", Supported: supported, Err: err}
 }

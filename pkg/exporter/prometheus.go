@@ -60,8 +60,13 @@ type Exporter struct {
 	cachedHealth atomic.Pointer[HealthStats]
 
 	// Self-monitoring counters.
-	pollCount    atomic.Uint64
-	ringbufDrops atomic.Uint64
+	pollCount atomic.Uint64
+
+	// Kernel-side drop totals, mirrored from the BPF drop_counters map via
+	// SetKernelDropStats. Cumulative — the kernel owns the counters and
+	// userspace only republishes them.
+	ringbufDrops   atomic.Uint64
+	mapUpdateDrops atomic.Uint64
 }
 
 // SetHealthStats sets the callback for agent health metrics.
@@ -80,9 +85,17 @@ func (e *Exporter) RecordPoll() {
 	}
 }
 
-// RecordRingbufDrop records a ring buffer drop.
-func (e *Exporter) RecordRingbufDrop() {
-	e.ringbufDrops.Add(1)
+// SetKernelDropStats publishes the cumulative kernel-side drop counters.
+// ringbufDrops is the total of BPF ring-buffer reserve failures (lost
+// lifecycle events + DNS captures); mapUpdateDrops is the total of
+// map-full update failures (flow_aggregates + quic_flows). Both are
+// monotonic totals read from the kernel drop_counters map on each poll
+// tick, so this stores rather than increments. It replaces the old
+// RecordRingbufDrop, which had no callers — the metric read 0 forever
+// while the kernel silently dropped data (P4).
+func (e *Exporter) SetKernelDropStats(ringbufDrops, mapUpdateDrops uint64) {
+	e.ringbufDrops.Store(ringbufDrops)
+	e.mapUpdateDrops.Store(mapUpdateDrops)
 }
 
 // podKey identifies a pod for per-pod metrics.
@@ -431,6 +444,10 @@ func (e *Exporter) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(bw, "# HELP tollwing_ringbuf_drops_total Ring buffer events dropped due to full buffer.\n")
 	fmt.Fprintf(bw, "# TYPE tollwing_ringbuf_drops_total counter\n")
 	fmt.Fprintf(bw, "tollwing_ringbuf_drops_total %d\n", e.ringbufDrops.Load())
+
+	fmt.Fprintf(bw, "# HELP tollwing_map_update_drops_total BPF map updates dropped because the map was full (flow_aggregates + quic_flows).\n")
+	fmt.Fprintf(bw, "# TYPE tollwing_map_update_drops_total counter\n")
+	fmt.Fprintf(bw, "tollwing_map_update_drops_total %d\n", e.mapUpdateDrops.Load())
 
 	// Health stats are sampled per poll tick (not per scrape) to avoid
 	// runtime.ReadMemStats STW pauses during Prometheus scrapes.

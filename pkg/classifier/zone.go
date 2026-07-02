@@ -166,12 +166,52 @@ func (z *ZoneResolver) queryIMDS(ctx context.Context, provider CloudProvider) (s
 		parts := strings.Split(raw, "/")
 		return parts[len(parts)-1], nil
 	case ProviderAzure:
-		return imdsGet(ctx, "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text", map[string]string{
+		zone, err := imdsGet(ctx, "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text", map[string]string{
 			"Metadata": "true",
 		})
+		if err != nil {
+			return "", err
+		}
+		if zone == "" {
+			// Non-zonal VM — leave the zone unresolved (P5: mark Unknown
+			// rather than guess a region-wide pseudo-zone).
+			return "", nil
+		}
+		// Azure IMDS returns the bare zone ordinal ("1", "2", "3").
+		// regionFromZone("1") yields "1", so two nodes in zones "1" and
+		// "2" of the SAME region compared as different regions and every
+		// cross-AZ flow misclassified as cross_region. Qualify with the
+		// region ("eastus-1") so regionFromZone recovers the region.
+		location, err := imdsGet(ctx, "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text", map[string]string{
+			"Metadata": "true",
+		})
+		if err != nil {
+			return "", fmt.Errorf("azure zone %q needs its region for qualification: %w", zone, err)
+		}
+		return QualifyAzureZone(location, zone), nil
 	default:
 		return "", fmt.Errorf("unknown provider: %s", provider)
 	}
+}
+
+// QualifyAzureZone joins an Azure region and a bare zone ordinal into the
+// canonical "<region>-<ordinal>" zone string ("eastus-1") that regionFromZone
+// parses. Zones that already carry a region qualifier pass through unchanged.
+// Exported for the Azure cloud provider (pkg/cloud/azure), which sees the
+// same bare ordinals in its subnet API responses.
+func QualifyAzureZone(region, zone string) string {
+	if zone == "" {
+		return ""
+	}
+	for i := 0; i < len(zone); i++ {
+		if zone[i] < '0' || zone[i] > '9' {
+			return zone // already qualified (or not a bare ordinal)
+		}
+	}
+	if region == "" {
+		return zone
+	}
+	return region + "-" + zone
 }
 
 // detectProvider probes IMDS endpoints to determine the cloud provider.

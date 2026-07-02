@@ -19,7 +19,7 @@ import (
 func main() {
 	var (
 		cgroupPath   = flag.String("cgroup", "/sys/fs/cgroup", "cgroup v2 mount path")
-		trackUDP     = flag.Bool("udp", false, "track UDP connections (DNS cost attribution)")
+		trackUDP     = flag.Bool("udp", false, "track UDP via connected sockets (DNS + per-pod QUIC attribution); makes the socket path the sole UDP TX source — unconnected-UDP egress is then uncounted (see pkg/ebpf/bpf/quic.bpf.c)")
 		sampleRate   = flag.Uint("sample-rate", 1, "connection sampling rate (1=all, N=1/N)")
 		pollInterval = flag.Duration("poll-interval", 5*time.Second, "map poll interval")
 		metricsAddr  = flag.String("metrics", ":9990", "Prometheus /metrics listen address")

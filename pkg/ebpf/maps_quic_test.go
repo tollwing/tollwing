@@ -32,11 +32,3 @@ func TestSidecarInfoStructSize(t *testing.T) {
 		t.Errorf("sizeof(SidecarInfo) = %d, want 16", got)
 	}
 }
-
-func TestCgroupCostBPFStructSize(t *testing.T) {
-	// Same as CgroupCost: 32 bytes
-	got := unsafe.Sizeof(CgroupCostBPF{})
-	if got != 32 {
-		t.Errorf("sizeof(CgroupCostBPF) = %d, want 32", got)
-	}
-}

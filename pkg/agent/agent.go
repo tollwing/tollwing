@@ -28,51 +28,8 @@ import (
 	"github.com/tollwing/tollwing/pkg/poller"
 )
 
-// Config holds the top-level agent configuration.
-type Config struct {
-	// CgroupPath is the cgroup v2 mount point. Default: /sys/fs/cgroup
-	CgroupPath string
-
-	// TrackUDP enables UDP connect tracking for DNS cost attribution.
-	TrackUDP bool
-
-	// SampleRate controls connection sampling (1 = all, N = 1/N).
-	SampleRate uint8
-
-	// PollInterval controls how often the map poller reads connections. Default: 5s.
-	PollInterval time.Duration
-
-	// MetricsAddr is the Prometheus /metrics listen address. Default: ":9990".
-	MetricsAddr string
-
-	// Kubeconfig path. Empty = in-cluster config. Set to "disable" to skip K8s integration.
-	Kubeconfig string
-
-	// LogLevel sets the slog level. Default: INFO.
-	LogLevel slog.Level
-
-	// LogJSON enables structured JSON logging (for production).
-	LogJSON bool
-
-	// Provider overrides cloud provider auto-detection ("aws", "gcp", "azure").
-	// If empty, detected via IMDS.
-	Provider string
-
-	// Region is the cloud region for cost calculation. Default: auto-detected.
-	Region string
-
-	// NATSUrl is the NATS server URL for shipping flows to the control plane.
-	// Empty disables NATS publishing.
-	NATSUrl string
-
-	// ClusterName identifies this cluster in multi-cluster deployments.
-	ClusterName string
-
-	// NodeName identifies this node. Default: hostname.
-	NodeName string
-}
-
 // Agent is the top-level tollwing-agent orchestrator.
+// Config lives in config.go (cross-platform).
 type Agent struct {
 	cfg             Config
 	log             *slog.Logger
@@ -105,6 +62,8 @@ type Agent struct {
 
 // New creates a new Agent with the given configuration.
 func New(cfg Config) *Agent {
+	cfg.setDefaults()
+
 	var handler slog.Handler
 	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
 	if cfg.LogJSON {
@@ -130,6 +89,11 @@ func New(cfg Config) *Agent {
 // Run starts the agent and blocks until the context is cancelled or a
 // termination signal is received. Returns nil on clean shutdown.
 func (a *Agent) Run(ctx context.Context) error {
+	// Fail fast on config that would silently drop data (see Config.validate).
+	if err := a.cfg.validate(); err != nil {
+		return fmt.Errorf("invalid agent config: %w", err)
+	}
+
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -187,7 +151,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.loader.Start(ctx); err != nil {
 		return fmt.Errorf("start ebpf loader: %w", err)
 	}
-	defer a.loader.Close()
+	// One deferred teardown with an explicit dependency order (see
+	// runShutdown in shutdown.go) instead of per-component defers: the
+	// defer stack's LIFO order closed the NATS publisher BEFORE the
+	// poller's final flush, losing the last poll interval of flow data on
+	// every rolling restart.
+	defer a.shutdown()
 
 	// Get DNS tracker from loader (nil if kernel too old).
 	a.dnsTracker = a.loader.DNSTracker()
@@ -201,6 +170,14 @@ func (a *Agent) Run(ctx context.Context) error {
 	if flowAggMap != nil {
 		a.poller = poller.New(poller.Config{
 			Interval: a.cfg.PollInterval,
+			OnDrops: func(dc bpf.DropCounters) {
+				// The exporter is constructed after the poller below; the
+				// first tick fires >= one interval later, so the nil guard
+				// only covers startup.
+				if a.exporter != nil {
+					a.exporter.SetKernelDropStats(dc.RingbufDrops(), dc.MapUpdateDrops())
+				}
+			},
 		}, flowAggMap, a.handlePoll, a.log)
 
 		// Wire QUIC flows map if available.
@@ -209,8 +186,14 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.log.Info("QUIC flow polling enabled")
 		}
 
+		// Wire kernel drop counters so tollwing_ringbuf_drops_total /
+		// tollwing_map_update_drops_total report real drops, not a
+		// constant 0 (DEC-016 follow-up).
+		if dropMap := maps["drop_counters"]; dropMap != nil {
+			a.poller.SetDropCountersMap(dropMap)
+		}
+
 		a.poller.Start(ctx)
-		defer a.poller.Stop()
 	}
 
 	// Start Prometheus exporter.
@@ -237,21 +220,35 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	// Start NATS publisher if configured.
 	if a.cfg.NATSUrl != "" {
-		nodeName := a.cfg.NodeName
-		if nodeName == "" {
-			nodeName, _ = os.Hostname()
+		nodeName, err := resolveNodeName(a.cfg.NodeName)
+		if err != nil {
+			return fmt.Errorf("nats publishing: %w", err)
 		}
+		// Per DEC-019, resolve a non-empty cluster identity up front and
+		// fail fast: an empty -cluster used to build the subject
+		// "tollwing.flows..node", which NATS rejected on EVERY publish —
+		// the agent warn-and-dropped each flow batch forever instead of
+		// surfacing one loud startup error.
+		var deriveUID func(context.Context) (string, error)
+		if a.informer != nil {
+			deriveUID = a.informer.ClusterUID
+		}
+		cluster, err := resolveClusterName(ctx, a.cfg.ClusterName, deriveUID, a.log)
+		if err != nil {
+			return fmt.Errorf("nats publishing: %w", err)
+		}
+		a.cfg.ClusterName = cluster
+
 		pub, err := ccnats.NewPublisher(ccnats.PublisherConfig{
 			URL:     a.cfg.NATSUrl,
-			Cluster: a.cfg.ClusterName,
+			Cluster: cluster,
 			Node:    nodeName,
 		}, a.log)
 		if err != nil {
 			a.log.Warn("nats publisher init failed, flows will not be shipped", "err", err)
 		} else {
 			a.natsPublisher = pub
-			defer a.natsPublisher.Close()
-			a.log.Info("nats publisher started", "url", a.cfg.NATSUrl, "cluster", a.cfg.ClusterName)
+			a.log.Info("nats publisher started", "url", a.cfg.NATSUrl, "cluster", cluster, "node", nodeName)
 		}
 	}
 
@@ -260,6 +257,26 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("shutting down")
 
 	return nil
+}
+
+// shutdown binds the agent's components to runShutdown's documented
+// teardown order: poller final flush → NATS drain → eBPF detach.
+func (a *Agent) shutdown() {
+	var stopPoller, closePublisher, closeLoader func()
+	if a.poller != nil {
+		stopPoller = a.poller.Stop
+	}
+	if a.natsPublisher != nil {
+		closePublisher = a.natsPublisher.Close
+	}
+	if a.loader != nil {
+		closeLoader = func() {
+			if err := a.loader.Close(); err != nil {
+				a.log.Warn("ebpf loader close failed", "err", err)
+			}
+		}
+	}
+	runShutdown(stopPoller, closePublisher, closeLoader)
 }
 
 // initCostEngine sets up the cost calculation engine with the appropriate
@@ -343,6 +360,20 @@ func (a *Agent) initTopologyRefresher(ctx context.Context) {
 			a.log.Warn("failed to create EC2 SDK client, topology refresh will be limited", "err", err)
 		} else {
 			awsProvider.SetEC2Client(ec2Client)
+		}
+		// Wire live pricing so the 6h rate-card refresher below fetches real
+		// Price List rates. Without this client, GetRateCard always returns
+		// DefaultAWSRateCard and the "refresh" silently re-fetches the dated
+		// hardcoded defaults forever. Per P4, cost = bytes × dated rate —
+		// the rate card must be current or its staleness must be loud, so a
+		// failed init warns and degrades to the defaults instead of hiding.
+		pcCtx, pcCancel := context.WithTimeout(ctx, 10*time.Second)
+		pricingClient, perr := awscloud.NewPricingClient(pcCtx, a.log)
+		pcCancel()
+		if perr != nil {
+			a.log.Warn("aws pricing client init failed, rate cards fall back to dated defaults", "err", perr)
+		} else {
+			awsProvider.SetPricingClient(pricingClient)
 		}
 		cloudProvider = awsProvider
 	default:
