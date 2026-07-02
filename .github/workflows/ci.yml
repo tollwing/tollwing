@@ -76,12 +76,21 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       # go vet walks the go:embed of the compiled BPF objects, so compile first.
-      - name: Ensure LLVM toolchain (skip install if the runner already has clang)
+      - name: Ensure LLVM toolchain (reuse the runner's preinstalled clang)
         run: |
           if command -v clang >/dev/null && command -v llvm-strip >/dev/null; then
-            echo "clang + llvm-strip already present: $(clang --version | head -1)"
+            echo "clang + llvm-strip already on PATH"
           else
-            sudo apt-get update && sudo apt-get install -y clang llvm
+            # ubuntu-24.04 ships versioned clang-NN/llvm-strip-NN but no
+            # unversioned symlink; link the newest instead of a full apt install.
+            v=$(ls /usr/bin/clang-[0-9]* 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tail -1)
+            if [ -n "$v" ] && [ -x "/usr/bin/clang-$v" ] && [ -x "/usr/bin/llvm-strip-$v" ]; then
+              sudo ln -sf "/usr/bin/clang-$v" /usr/local/bin/clang
+              sudo ln -sf "/usr/bin/llvm-strip-$v" /usr/local/bin/llvm-strip
+              echo "symlinked preinstalled clang-$v / llvm-strip-$v (skipped apt)"
+            else
+              sudo apt-get update && sudo apt-get install -y clang llvm
+            fi
           fi
       - name: Compile BPF
         run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
@@ -100,12 +109,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Ensure LLVM toolchain (skip install if the runner already has clang)
+      - name: Ensure LLVM toolchain (reuse the runner's preinstalled clang)
         run: |
           if command -v clang >/dev/null && command -v llvm-strip >/dev/null; then
-            echo "clang + llvm-strip already present: $(clang --version | head -1)"
+            echo "clang + llvm-strip already on PATH"
           else
-            sudo apt-get update && sudo apt-get install -y clang llvm
+            # ubuntu-24.04 ships versioned clang-NN/llvm-strip-NN but no
+            # unversioned symlink; link the newest instead of a full apt install.
+            v=$(ls /usr/bin/clang-[0-9]* 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tail -1)
+            if [ -n "$v" ] && [ -x "/usr/bin/clang-$v" ] && [ -x "/usr/bin/llvm-strip-$v" ]; then
+              sudo ln -sf "/usr/bin/clang-$v" /usr/local/bin/clang
+              sudo ln -sf "/usr/bin/llvm-strip-$v" /usr/local/bin/llvm-strip
+              echo "symlinked preinstalled clang-$v / llvm-strip-$v (skipped apt)"
+            else
+              sudo apt-get update && sudo apt-get install -y clang llvm
+            fi
           fi
       - name: Compile BPF
         run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
@@ -133,12 +151,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Ensure LLVM toolchain (skip install if the runner already has clang)
+      - name: Ensure LLVM toolchain (reuse the runner's preinstalled clang)
         run: |
           if command -v clang >/dev/null && command -v llvm-strip >/dev/null; then
-            echo "clang + llvm-strip already present: $(clang --version | head -1)"
+            echo "clang + llvm-strip already on PATH"
           else
-            sudo apt-get update && sudo apt-get install -y clang llvm
+            # ubuntu-24.04 ships versioned clang-NN/llvm-strip-NN but no
+            # unversioned symlink; link the newest instead of a full apt install.
+            v=$(ls /usr/bin/clang-[0-9]* 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tail -1)
+            if [ -n "$v" ] && [ -x "/usr/bin/clang-$v" ] && [ -x "/usr/bin/llvm-strip-$v" ]; then
+              sudo ln -sf "/usr/bin/clang-$v" /usr/local/bin/clang
+              sudo ln -sf "/usr/bin/llvm-strip-$v" /usr/local/bin/llvm-strip
+              echo "symlinked preinstalled clang-$v / llvm-strip-$v (skipped apt)"
+            else
+              sudo apt-get update && sudo apt-get install -y clang llvm
+            fi
           fi
       - name: Compile BPF (x86 + arm64)
         run: make -f pkg/ebpf/bpf/Makefile bpf-all CLANG=clang LLVM_STRIP=llvm-strip
