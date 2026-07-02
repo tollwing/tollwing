@@ -13,6 +13,7 @@ The audience explicitly includes **AI agents**: an ADR is how a future agent inh
 <!-- INDEX:BEGIN -->
 | ID | Title | Status | Date | Principles |
 |---|---|---|---|---|
+| [DEC-021](DEC-021-free-network-cost-scan.md) | Ship a free one-shot network-cost scan (`tollwing-scan`) | ACCEPTED | 2026-07-02 | P1, P4, P5, P11 |
 | [DEC-019](DEC-019-cluster-identity-fail-fast-nats-subject.md) | Derive cluster identity from the kube-system UID and fail fast on invalid NATS subjects | ACCEPTED | 2026-07-02 | P1, P3, P4, P11 |
 | [DEC-017](DEC-017-remove-dead-proto-and-honest-cost-export.md) | Remove the dead proto/ contract and re-scope opencost-plugin as an honest cost-export sidecar | ACCEPTED | 2026-07-02 | P1, P2, P4, P6, P9, P11 |
 | [DEC-016](DEC-016-remove-dormant-cgroup-storage-iterator-and-conntrack-machinery.md) | Remove dormant cgroup-storage, sk-storage-iterator, and conntrack NAT machinery from the data plane | ACCEPTED | 2026-07-02 | P1, P2, P3, P5 |

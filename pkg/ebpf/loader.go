@@ -14,7 +14,6 @@ import (
 	"net"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 
@@ -163,8 +162,10 @@ func (l *Loader) Start(ctx context.Context) error {
 	}
 	l.collection = coll
 
-	// Free kernel BTF cache — it's large and no longer needed after load.
-	btf.FlushKernelSpec()
+	// The kernel BTF is large; nudge the runtime to release it after load.
+	// (cilium/ebpf >= v0.22 dropped the global btf cache + FlushKernelSpec in
+	// favour of explicit btf.Cache instances, so there is no global cache to
+	// flush here — the CollectionSpec load owns its BTF and drops it on return.)
 	runtime.GC()
 
 	// ---- Attach cgroup/connect4 + connect6 ----

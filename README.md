@@ -36,6 +36,28 @@ nat_gateway         $1.23   (10%)
 
 No control-plane server is needed for this single-cluster view: the agent exposes the metrics, your Prometheus scrapes them, Grafana shows them.
 
+## One-command scan: where's my data-transfer money going?
+
+Once the agent is scraped by Prometheus, `tollwing-scan` prints the headline in one shot: spend by AWS billing path over a window, projected to a month, the **addressable** slice (cross-AZ + NAT, the paths with a known low-effort fix), and the top cost-driving pods.
+
+```sh
+go run ./cmd/tollwing-scan --prometheus http://prometheus:9090   # scan a live fleet
+make scan-demo                                                    # synthetic, no cluster
+```
+
+```
+  NETWORK DATA-TRANSFER COST
+     projected/mo    $2,050.50
+     addressable/mo  $1,504.50   (73%, has a known low-effort fix)
+
+  BY AWS BILLING PATH  (projected monthly)
+     cross_az                    $942.00      46%   ◀ addressable
+     nat_gateway                 $562.50      27%   ◀ addressable
+     internet_egress             $363.00      18%
+```
+
+Free and Apache-2.0, reads only the agent's metrics (`--json` for machine output). The per-connection detail and cost-savings reports are [Tollwing Enterprise](#open-core).
+
 ## How it compares
 
 | | per-pod | by AWS billing path | eBPF | dollars |
