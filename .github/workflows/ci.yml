@@ -50,17 +50,17 @@ jobs:
           [ "$fail" = 0 ] && echo "oss-guard: clean — no private code in the public tree"
           exit $fail
 
-  # Secret scan — no credentials/keys in the public tree (public repos are free).
+  # Secret scan — gitleaks CLI via the official image. The gitleaks-ACTION
+  # wrapper requires a PAID license for org-owned repos; the gitleaks tool
+  # itself is free/OSS, so we run the binary directly.
   secrets:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+      - name: gitleaks (detect over git history + tree)
+        run: docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks:latest detect --source . --redact --verbose
 
   lint:
     runs-on: ubuntu-24.04
